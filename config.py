@@ -11,7 +11,8 @@ DEFAULTS = {
     "song_offsets": {},        # song id -> extra seconds for that song only
     "scope": "all",            # which offset the buttons/hotkeys adjust: all | song
     "font_size": 34,
-    "theme": 0,
+    "theme": 0,                # index into overlay.THEMES; len(THEMES) = custom_color
+    "custom_color": None,      # "#rrggbb" picked by the user
     "show_trans": True,
     "show_next": True,         # preview the upcoming line under the current one
     "reveal": True,            # words appear one by one

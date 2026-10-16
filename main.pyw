@@ -8,14 +8,14 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, APP_DIR)
 
 from PySide6.QtCore import Qt, QAbstractNativeEventFilter, QPointF
-from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QAction, QActionGroup, QLinearGradient
+from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QAction, QLinearGradient
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
 
 from config import Config, DATA_DIR
 from ncm_reader import NcmReader
 from audiosync import AudioSync
-from overlay import LyricWindow, THEMES
+from overlay import LyricWindow
 
 INSTANCE_KEY = "ncm-desktop-lyrics-" + os.environ.get("USERNAME", "user")
 SHORTCUT_NAME = "网易云桌面歌词.lnk"
@@ -123,12 +123,7 @@ class Tray(QSystemTrayIcon):
         self.act_cal = self._action("按音频自动校准逐字时间", lambda _: window.toggle_calibrate(), checkable=True)
         self.act_sync = self._action("拖进度条后听声音自动对时", self._toggle_sync, checkable=True)
         theme_menu = menu.addMenu("配色")
-        self.theme_group = QActionGroup(self)
-        for i, (name, *_rest) in enumerate(THEMES):
-            a = theme_menu.addAction(name)
-            a.setCheckable(True)
-            a.triggered.connect(lambda _=False, i=i: window.set_theme(i))
-            self.theme_group.addAction(a)
+        theme_menu.aboutToShow.connect(lambda: window.fill_theme_menu(theme_menu))
         menu.addSeparator()
         self._action("全部歌曲偏移归零", lambda _: self._reset_global())
         self._action("回到默认位置", lambda _: window.reset_position())
@@ -167,7 +162,6 @@ class Tray(QSystemTrayIcon):
         self.act_ai.setChecked(cfg["ai_transcribe"])
         self.act_cal.setChecked(cfg["calibrate"])
         self.act_sync.setChecked(cfg["audio_sync"])
-        self.theme_group.actions()[cfg["theme"]].setChecked(True)
         self.act_boot.setChecked(os.path.exists(os.path.join(STARTUP_DIR, SHORTCUT_NAME)))
 
     def _toggle_sync(self, on):
@@ -208,6 +202,7 @@ class Tray(QSystemTrayIcon):
 
 def main():
     ctypes.windll.winmm.timeBeginPeriod(1)
+    sys.setswitchinterval(0.001)     # background threads hand the UI thread its turn sooner
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 

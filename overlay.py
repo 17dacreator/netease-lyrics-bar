@@ -7,16 +7,18 @@ import threading
 import time
 from collections import OrderedDict
 
-from PySide6.QtCore import Qt, QTimer, QRect, QRectF, QPointF, Signal
+from PySide6.QtCore import Qt, QObject, QTimer, QRect, QRectF, QPointF, Signal
 from PySide6.QtGui import (QPainter, QPainterPath, QFont, QFontMetricsF, QColor, QPen, QLinearGradient,
                            QCursor, QGuiApplication, QImage)
-from PySide6.QtWidgets import QWidget, QPushButton, QHBoxLayout
+from PySide6.QtGui import QIcon, QPixmap
+from PySide6.QtWidgets import QWidget, QPushButton, QHBoxLayout, QMenu, QColorDialog, QProxyStyle, QStyle
 
 import lyrics as lyr
 from worker_client import WorkerClient
 
 user32 = ctypes.windll.user32
 user32.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wt.UINT]
+dwmapi = ctypes.WinDLL("dwmapi")
 user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
 user32.GetWindowLongPtrW.argtypes = [wt.HWND, ctypes.c_int]
 user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
@@ -47,7 +49,73 @@ THEMES = [
     ("暖金", "#fff1b8", "#ffa94d", "#ffffff"),
     ("薄荷绿", "#c8ffe4", "#20d39b", "#ffffff"),
     ("纯白", "#ffffff", "#f1f1f1", "#9a9a9a"),
+    ("樱花粉", "#ffd6e7", "#ff6fa8", "#ffffff"),     # added later: keep earlier indices stable
+    ("星空紫", "#e2d4ff", "#8a5cff", "#ffffff"),
 ]
+CUSTOM = len(THEMES)          # cfg["theme"] value for the user's own colour
+
+# Popup menus get an explicit look; the default one rendered nearly black on this setup.
+MENU_CSS = """
+QMenu { background: rgba(26,26,32,242); border: 1px solid rgba(255,255,255,45); border-radius: 10px; padding: 6px; }
+QMenu::item { color: #f2f2f2; padding: 6px 16px 6px 8px; border-radius: 6px; font: 13px "Microsoft YaHei UI"; }
+QMenu::item:selected { background: rgba(255,255,255,46); color: #ffffff; }
+QMenu::icon { padding-left: 6px; }
+QMenu::separator { height: 1px; background: rgba(255,255,255,40); margin: 5px 8px; }
+"""
+
+
+def theme_colors(cfg):
+    """(name, sung top, sung bottom, unsung) for the configured theme, including a custom colour."""
+    if cfg.get("theme") == CUSTOM and cfg.get("custom_color"):
+        base = QColor(cfg["custom_color"])
+        return "自定义", base.lighter(145).name(), base.name(), "#ffffff"
+    index = cfg.get("theme", 0)
+    return THEMES[index if 0 <= index < len(THEMES) else 0]
+
+
+MENU_ICON = 22                # px; menus otherwise squeeze icons into 16 x 16
+
+
+def theme_icon(top, bottom, unsung):
+    """A colour chip: unsung colour on the left sweeping into the sung gradient."""
+    dpr, size = 2, MENU_ICON
+    pm = QPixmap(size * dpr, size * dpr)
+    pm.setDevicePixelRatio(dpr)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    clip = QPainterPath()
+    clip.addRoundedRect(QRectF(0.5, 2.5, size - 1, size - 5), 5, 5)
+    p.setClipPath(clip)
+    split = size * 0.38
+    p.fillRect(QRectF(0, 0, split, size), QColor(unsung))
+    grad = QLinearGradient(0, 2, 0, size - 2)
+    grad.setColorAt(0, QColor(top))
+    grad.setColorAt(1, QColor(bottom))
+    p.fillRect(QRectF(split, 0, size - split, size), grad)
+    p.setClipping(False)
+    p.setPen(QPen(QColor(0, 0, 0, 110), 1))
+    p.setBrush(Qt.NoBrush)
+    p.drawPath(clip)
+    p.end()
+    return QIcon(pm)
+
+
+class _MenuStyle(QProxyStyle):
+    def pixelMetric(self, metric, option=None, widget=None):
+        if metric == QStyle.PM_SmallIconSize:
+            return MENU_ICON
+        return super().pixelMetric(metric, option, widget)
+
+
+def styled_menu(parent):
+    menu = QMenu(parent)
+    menu._style = _MenuStyle()        # keep a reference: the menu doesn't own it
+    menu.setStyle(menu._style)
+    menu.setStyleSheet(MENU_CSS)
+    menu.setAttribute(Qt.WA_TranslucentBackground)
+    menu.setWindowFlags(menu.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
+    return menu
 
 BUTTON_CSS = """
 QPushButton { color: #f4f4f4; background: rgba(255,255,255,30); border: none; border-radius: 7px;
@@ -55,6 +123,7 @@ QPushButton { color: #f4f4f4; background: rgba(255,255,255,30); border: none; bo
 QPushButton:hover { background: rgba(255,255,255,70); }
 QPushButton:checked { background: rgba(255,70,105,170); }
 QPushButton#offset { min-width: 104px; font-weight: bold; background: rgba(255,255,255,48); }
+QPushButton::menu-indicator { width: 0; }
 """
 
 
@@ -82,6 +151,44 @@ class OffsetButton(QPushButton):
             self.reset.emit()
         else:
             super().mousePressEvent(e)
+
+
+class VsyncPump(QObject):
+    """Beats in step with the display (DwmFlush), every `divider` refreshes, while switched on.
+
+    A fixed 8 ms timer beats against a 144/180 Hz screen, so the sweep advanced by one
+    or two refreshes at a time and looked jittery. Frames timed off the compositor land
+    evenly on the screen's refreshes instead.
+    """
+    beat = Signal()
+
+    def __init__(self, divider):
+        super().__init__()
+        self.divider = max(1, divider)
+        self._on = threading.Event()
+        self._queued = False           # a beat is waiting for the UI thread
+        threading.Thread(target=self._loop, name="vsync", daemon=True).start()
+
+    @property
+    def active(self):
+        return self._on.is_set()
+
+    def set_active(self, on):
+        (self._on.set if on else self._on.clear)()
+
+    def handled(self):
+        self._queued = False
+
+    def _loop(self):
+        count = 0
+        while True:
+            self._on.wait()
+            if dwmapi.DwmFlush() != 0:          # no compositor: fall back to ~8 ms steps
+                time.sleep(0.008)
+            count += 1
+            if count % self.divider == 0 and not self._queued:
+                self._queued = True
+                self.beat.emit()
 
 
 class UnlockBubble(QWidget):
@@ -141,7 +248,15 @@ class LyricWindow(QWidget):
         self.bubble.winId()           # create the native window now so the first show is instant
 
         self._save_timer = QTimer(self, singleShot=True, interval=400, timeout=self.cfg.save)
-        self._tick_timer = QTimer(self, timerType=Qt.PreciseTimer, interval=8, timeout=self._tick)
+        self._tick_timer = QTimer(self, timerType=Qt.PreciseTimer, interval=8, timeout=self._on_timer)
+        refresh = QGuiApplication.primaryScreen().refreshRate() or 60.0
+        self._pump = VsyncPump(round(refresh / 100))      # 180 Hz -> every 2nd refresh, 144/120/60 -> every one
+        self._pump.beat.connect(self._on_beat)
+        self._last_beat = 0.0
+        self._elide_cache = {}
+        self._toast_font = QFont(FONT_FAMILY)
+        self._toast_font.setPixelSize(13)
+        self._toast_fm = QFontMetricsF(self._toast_font)
         self._topmost_timer = QTimer(self, interval=2000, timeout=self._keep_topmost)
         self._apply_geometry(initial=True)
 
@@ -174,7 +289,10 @@ class LyricWindow(QWidget):
         self.gap_btn = button("间奏", "没人唱的时候标出「前奏 / 间奏 / 尾奏」", self.toggle_gap, checkable=True)
         button("A−", "字小一点", lambda: self.change_font(-2))
         button("A+", "字大一点", lambda: self.change_font(2))
-        button("配色", "换一套颜色", self.next_theme)
+        self.theme_btn = button("配色 ▾", "选歌词颜色", lambda: None)
+        self.theme_menu = styled_menu(self.theme_btn)
+        self.theme_menu.aboutToShow.connect(lambda: self.fill_theme_menu(self.theme_menu))
+        self.theme_btn.setMenu(self.theme_menu)
         row.addStretch(1)
         # functions
         button("−0.1", "歌词推迟 0.1 秒", lambda: self.adjust_offset(-0.1))
@@ -295,9 +413,40 @@ class LyricWindow(QWidget):
             self._relayout()
             self._save_timer.start()
 
-    def next_theme(self):
-        self.set_theme((self.cfg["theme"] + 1) % len(THEMES))
-        self.toast(THEMES[self.cfg["theme"]][0])
+    def fill_theme_menu(self, menu):
+        """(Re)build a colour menu: presets with swatches, the custom colour if there is one, a picker."""
+        menu.clear()
+        current = self.cfg["theme"]
+        for i, (name, top, bottom, unsung) in enumerate(THEMES):
+            act = menu.addAction(theme_icon(top, bottom, unsung), name + ("  ✓" if i == current else ""))
+            act.triggered.connect(lambda _=False, i=i: self.set_theme(i))
+        menu.addSeparator()
+        if self.cfg.get("custom_color"):
+            _, top, bottom, unsung = theme_colors({"theme": CUSTOM, "custom_color": self.cfg["custom_color"]})
+            act = menu.addAction(theme_icon(top, bottom, unsung), "自定义" + ("  ✓" if current == CUSTOM else ""))
+            act.triggered.connect(lambda: self.set_theme(CUSTOM))
+        menu.addAction("挑一个颜色…").triggered.connect(self.pick_custom_color)
+
+    def pick_custom_color(self):
+        """Colour dialog with a live preview on the lyrics; cancel puts the old colours back."""
+        before = (self.cfg["theme"], self.cfg.get("custom_color"))
+        dialog = QColorDialog(QColor(self.cfg.get("custom_color") or theme_colors(self.cfg)[2]))
+        dialog.setWindowTitle("自定义歌词颜色")
+        dialog.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+
+        def preview(color):
+            if color.isValid():
+                self.cfg["custom_color"], self.cfg["theme"] = color.name(), CUSTOM
+                self._shapes.clear()
+                self._force_paint = True
+
+        dialog.currentColorChanged.connect(preview)
+        if dialog.exec():
+            self.cfg["custom_color"] = dialog.selectedColor().name()
+            self.set_theme(CUSTOM)
+        else:
+            self.cfg["custom_color"] = before[1]
+            self.set_theme(before[0])
 
     def set_theme(self, idx):
         self.cfg["theme"] = idx
@@ -633,6 +782,17 @@ class LyricWindow(QWidget):
 
     # -- per-frame update ------------------------------------------------------
 
+    def _on_beat(self):
+        self._pump.handled()
+        self._last_beat = time.perf_counter()
+        self._tick()
+
+    def _on_timer(self):
+        if self._pump.active and time.perf_counter() - self._last_beat < 0.05:
+            self._update_hover()           # the display pump is drawing; just keep the hover state fresh
+            return
+        self._tick()
+
     def _tick(self):
         state, song_id, duration, pos = self.reader.snapshot()
         if self.sync is not None and song_id and song_id == self.sync._song:
@@ -640,16 +800,29 @@ class LyricWindow(QWidget):
         if song_id != self.song_id:
             self._load_song(song_id, duration)
         if not self.isVisible():
-            self._tick_timer.setInterval(200)
+            self._pump.set_active(False)
+            if self._tick_timer.interval() != 200:
+                self._tick_timer.setInterval(200)
             return
         self._update_hover()
         frame = self._compose(state, pos + self.effective_offset())
         if frame != self._frame or self._force_paint:
-            self._frame, self._force_paint = frame, False
-            self.update()
-        # Fast frames only while something animates; otherwise sleep until the next line starts.
+            old, self._frame = self._frame, frame
+            if old is not None and not self._force_paint and old[1:] == frame[1:]:
+                self.update(self._row1_rect())    # only the current line moved
+            else:
+                self.update()
+            self._force_paint = False
+        # Display-synced frames while something animates; otherwise sleep until the next change.
         wake = self._wake if state == "playing" else max(self._wake, 0.05)
-        self._tick_timer.setInterval(8 if wake <= 0.008 else min(50, math.ceil(wake * 1000)))
+        animating = wake <= 0.008
+        self._pump.set_active(animating)
+        interval = 50 if animating else min(50, max(1, math.ceil(wake * 1000)))
+        if self._tick_timer.interval() != interval:      # resetting it every tick made frames drift
+            self._tick_timer.setInterval(interval)
+
+    def _row1_rect(self):
+        return QRect(0, TOOLBAR_H - 8, self.width(), int(self.cfg["font_size"] * 1.5) + 18)
 
     def _update_hover(self):
         pos = QCursor.pos()
@@ -770,7 +943,10 @@ class LyricWindow(QWidget):
         reveal = None
         if self.cfg["reveal"] and words:
             bounds = self._bounds(cur.text, size, words)
-            k = bisect.bisect_right([w.start for w in words], t)
+            starts = getattr(cur, "_starts", None)
+            if starts is None:
+                starts = cur._starts = [w.start for w in words]
+            k = bisect.bisect_right(starts, t)
             if k < len(words):
                 wake = min(wake, words[k].start - t)
             if k == 0:
@@ -851,10 +1027,12 @@ class LyricWindow(QWidget):
 
     def _elide(self, text, size, avail):
         key = (text, size, avail)
-        if key != getattr(self, "_elide_key", None):
-            self._elide_key = key
-            self._elide_val = QFontMetricsF(self._font(size)).elidedText(text, Qt.ElideRight, avail)
-        return self._elide_val
+        hit = self._elide_cache.get(key)
+        if hit is None:                 # translation and next line alternate: keep both
+            if len(self._elide_cache) > 256:
+                self._elide_cache.clear()
+            hit = self._elide_cache[key] = QFontMetricsF(self._font(size)).elidedText(text, Qt.ElideRight, avail)
+        return hit
 
     def _bounds(self, text, size, words):
         """[(x0, x1, edge)] per word in text coordinates.
@@ -879,12 +1057,12 @@ class LyricWindow(QWidget):
 
     def _shape(self, text, size, role):
         dpr = self.devicePixelRatioF()
-        key = (text, size, role, self.cfg["theme"], dpr)
+        key = (text, size, role, self.cfg["theme"], self.cfg.get("custom_color"), dpr)
         shape = self._shapes.get(key)
         if shape:
             self._shapes.move_to_end(key)
             return shape
-        _, top, bottom, unsung = THEMES[self.cfg["theme"]]
+        _, top, bottom, unsung = theme_colors(self.cfg)
         font = self._font(size)
         fm = QFontMetricsF(font)
         stroke = max(2.0, size * 0.075)
@@ -1000,9 +1178,7 @@ class LyricWindow(QWidget):
         """A small pill in the strip above the lyrics, so messages never cover a lyric row."""
         p.save()
         p.setOpacity(1.0)
-        font = QFont(FONT_FAMILY)
-        font.setPixelSize(13)
-        fm = QFontMetricsF(font)
+        font, fm = self._toast_font, self._toast_fm
         tw = min(fm.horizontalAdvance(text), w - 60)
         rect = QRectF((w - tw) / 2 - 12, (TOOLBAR_H - 24) / 2 + 2, tw + 24, 24)
         p.setPen(Qt.NoPen)
