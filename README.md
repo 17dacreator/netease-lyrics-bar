@@ -32,7 +32,7 @@ pythonw main.pyw
 - 非网易云官方软件，跟网易云没有关系。
 - 歌词是播放时从公开接口（网易云、LRCLIB、QQ 音乐）现取、只缓存在你自己电脑的 `data/` 里，仓库和安装包里都不带任何歌词。
 - 定位播放进度的特征码来自 [Kxnrl/NetEase-Cloud-Music-DiscordRPC](https://github.com/Kxnrl/NetEase-Cloud-Music-DiscordRPC)（MIT）。
-- 本项目以 MIT 协议开源，见 `LICENSE`。
+- 本项目以 MIT 协议开源，见 `LICENSE`；定位播放进度用的特征码来自 Kxnrl 的项目，声明见 `THIRD_PARTY_NOTICES.md`。
 
 ## 用法
 
