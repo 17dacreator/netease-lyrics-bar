@@ -1,17 +1,29 @@
 """The lyric bar's side of worker.py: start it on demand, send jobs, route its replies."""
+import importlib.util
 import json
 import os
 import subprocess
 import sys
 import threading
 
+from config import DATA_DIR
+
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKER = os.path.join(APP_DIR, "worker.py")
-LOG = os.path.join(APP_DIR, "data", "worker.log")
+LOG = os.path.join(DATA_DIR, "worker.log")
+
+
+def ai_available():
+    """Calibration and transcription need a Python with torch, demucs and faster-whisper.
+    The packaged build for friends ships without them (several GB, NVIDIA only)."""
+    if getattr(sys, "frozen", False) or not os.path.exists(WORKER):
+        return False
+    return all(importlib.util.find_spec(m) for m in ("torch", "demucs", "faster_whisper"))
 
 
 class WorkerClient:
     def __init__(self):
+        self.available = ai_available()
         self._proc = None
         self._lock = threading.Lock()
         self._handlers = {}

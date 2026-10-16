@@ -634,7 +634,7 @@ class LyricWindow(QWidget):
             self.fetch_state = ""
             return
         self.fetch_state = "loading"
-        if song_id.isdigit() and (self.cfg["calibrate"] or self.cfg["ai_transcribe"]):
+        if self.worker.available and song_id.isdigit() and (self.cfg["calibrate"] or self.cfg["ai_transcribe"]):
             self.worker.submit({"job": "warm"})        # load the models while the lyrics download
         gen = self._fetch_gen
         threading.Thread(target=self._fetch_worker, args=(gen, song_id, duration, force), daemon=True).start()
@@ -661,7 +661,7 @@ class LyricWindow(QWidget):
             except Exception:
                 pass
         state = "ok"
-        if lyr.needs_more(ly) and self.cfg["ai_transcribe"] and gen == self._fetch_gen:
+        if lyr.needs_more(ly) and self.cfg["ai_transcribe"] and self.worker.available and gen == self._fetch_gen:
             known = lyr.ai_state(song_id)
             if isinstance(known, lyr.Lyrics):
                 ly = known
@@ -681,7 +681,7 @@ class LyricWindow(QWidget):
             cached = lyr.load_alignment(song_id, ly)
             if cached:
                 ly = lyr.apply_alignment(ly, cached)
-            else:
+            elif self.worker.available:
                 need_align = True
         self._fetched.emit(gen, song_id, ly, title, state)      # show them now, refine below
         if need_align:
@@ -737,6 +737,9 @@ class LyricWindow(QWidget):
         self._calib_job = jid
 
     def calibrate_now(self):
+        if not self.worker.available:
+            self.toast("这个版本没带 AI 组件，不能按声音校准")
+            return
         ly = getattr(self.lyrics, "raw", self.lyrics)
         if not lyr.can_calibrate(ly):
             self.toast("这首没有能校准的歌词")
@@ -946,19 +949,29 @@ class LyricWindow(QWidget):
             starts = getattr(cur, "_starts", None)
             if starts is None:
                 starts = cur._starts = [w.start for w in words]
+            prefixes = getattr(cur, "_prefixes", None)
+            if prefixes is None:                 # the line's text up to each word
+                acc, prefixes = "", [""]
+                for wd in words:
+                    acc += wd.text
+                    prefixes.append(acc)
+                cur._prefixes = prefixes
             k = bisect.bisect_right(starts, t)
             if k < len(words):
                 wake = min(wake, words[k].start - t)
             if k == 0:
-                reveal = (0.0, 0.0, 0.0)
+                reveal = ("", "", 0.0, 0.0)
             else:
                 age = t - words[k - 1].start
                 alpha = 1.0 if age >= REVEAL_FADE else round(0.3 + 0.7 * age / REVEAL_FADE, 1)
                 if alpha < 1.0:
                     wake = 0.0
                 if k < len(words) or alpha < 1.0:
+                    # Draw the words sung so far as text of their own (same positions as in the
+                    # full line) instead of cropping the whole line: cropping cut the first
+                    # letter's outline and let the next glyph peek out after brackets.
                     left = bounds[k - 2][2] if k >= 2 else 0.0
-                    reveal = (round(left, 1), round(bounds[k - 1][2], 1), alpha)
+                    reveal = (prefixes[k - 1], prefixes[k], round(left, 1), alpha)
                 focus = bounds[k - 1][1] if progress is None else min(progress, bounds[k - 1][1])
         scroll = self._scroll(width, focus, avail)
         if width > avail and t < cur.end and progress is None and not self.cfg["reveal"]:
@@ -1094,7 +1107,7 @@ class LyricWindow(QWidget):
         shape = _Shape()
         shape.image, shape.width, shape.height, shape.margin = img, width, height, margin
         self._shapes[key] = shape
-        while len(self._shapes) > 48:
+        while len(self._shapes) > 160:       # word-by-word reveal draws one image per prefix
             self._shapes.popitem(last=False)
         return shape
 
@@ -1128,36 +1141,21 @@ class LyricWindow(QWidget):
             x = self._x_for(base, scroll, w)
             y = top1 + (h1 - base.height) / 2 - base.margin
             ox = x + base.margin              # where the text itself starts
-
-            def draw(left, right, alpha=1.0):
-                p.save()
-                p.setClipRect(QRectF(left, 0, max(right - left, 0), h), Qt.IntersectClip)
-                p.setOpacity(p.opacity() * alpha)
-                if lit and progress:
-                    # Split at the sweep point rather than stacking the colour over the white:
-                    # each side is one complete layer, so the outline never doubles up and a
-                    # finished sweep looks exactly like a line drawn without one.
-                    cut = ox + progress
-                    p.save()
-                    p.setClipRect(QRectF(cut, 0, 1e6, h), Qt.IntersectClip)
-                    p.drawImage(QPointF(x, y), base.image)
-                    p.restore()
-                    p.setClipRect(QRectF(x - 1, 0, cut - x + 1, h), Qt.IntersectClip)
-                    p.drawImage(QPointF(x, y), lit.image)
-                else:
-                    p.drawImage(QPointF(x, y), base.image)
-                p.restore()
-
             p.save()
             p.setClipRect(clip)
             if reveal is None:
-                draw(x, x + base.image.width())
+                self._draw_line(p, text, mode, size1, x, y, ox, progress, h)
             else:
-                x0, x1, alpha = reveal
-                if x0 > 0:
-                    draw(x, ox + x0)
-                if alpha > 0:
-                    draw(ox + x0, ox + x1, alpha)
+                shown, newest, left, alpha = reveal
+                if shown:
+                    self._draw_line(p, shown, mode, size1, x, y, ox, progress, h)
+                if newest and alpha > 0:          # the word fading in, on top
+                    p.save()
+                    if shown:
+                        p.setClipRect(QRectF(ox + left, 0, 1e6, h), Qt.IntersectClip)
+                    p.setOpacity(p.opacity() * alpha)
+                    self._draw_line(p, newest, mode, size1, x, y, ox, progress, h)
+                    p.restore()
             p.restore()
         y = top1 + h1
         for text, role in rows:
@@ -1188,6 +1186,28 @@ class LyricWindow(QWidget):
         p.setPen(QColor(255, 255, 255, 235))
         p.drawText(rect, Qt.AlignCenter, fm.elidedText(text, Qt.ElideRight, tw))
         p.restore()
+
+    def _draw_line(self, p, text, mode, size, x, y, ox, progress, h):
+        """`text` (the whole line or the start of it) at the line's position, with the sweep."""
+        if mode == "karaoke":
+            base, lit = self._shape(text, size, "unsung"), self._shape(text, size, "sung")
+        else:
+            base, lit = self._shape(text, size, mode), None
+        if lit and progress:
+            # Split at the sweep point rather than stacking the colour over the white: each
+            # side is one complete layer, so the outline never doubles up and a finished
+            # sweep looks exactly like a line drawn without one.
+            cut = ox + progress
+            p.save()
+            p.setClipRect(QRectF(cut, 0, 1e6, h), Qt.IntersectClip)
+            p.drawImage(QPointF(x, y), base.image)
+            p.restore()
+            p.save()
+            p.setClipRect(QRectF(x - 1, 0, cut - x + 1, h), Qt.IntersectClip)
+            p.drawImage(QPointF(x, y), lit.image)
+            p.restore()
+        else:
+            p.drawImage(QPointF(x, y), base.image)
 
     @staticmethod
     def _x_for(shape, scroll, w):

@@ -1,8 +1,10 @@
 """Settings stored as JSON next to the app (data/config.json)."""
 import json
 import os
+import sys
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+# Packaged (PyInstaller) builds keep their data next to the exe, not inside _internal.
+APP_DIR = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
 DATA_DIR = os.path.join(APP_DIR, "data")
 CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 

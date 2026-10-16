@@ -3,6 +3,7 @@ import ctypes
 import ctypes.wintypes as wt
 import os
 import sys
+import time
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, APP_DIR)
@@ -96,9 +97,13 @@ def pythonw_exe():
 def write_shortcut(path, icon_path):
     import win32com.client
     sc = win32com.client.Dispatch("WScript.Shell").CreateShortCut(path)
-    sc.TargetPath = pythonw_exe()
-    sc.Arguments = f'"{os.path.join(APP_DIR, "main.pyw")}"'
-    sc.WorkingDirectory = APP_DIR
+    if getattr(sys, "frozen", False):            # packaged build: point at the exe itself
+        sc.TargetPath = sys.executable
+        sc.WorkingDirectory = os.path.dirname(sys.executable)
+    else:
+        sc.TargetPath = pythonw_exe()
+        sc.Arguments = f'"{os.path.join(APP_DIR, "main.pyw")}"'
+        sc.WorkingDirectory = APP_DIR
     if os.path.exists(icon_path):
         sc.IconLocation = icon_path
     sc.Description = "网易云桌面歌词"
@@ -122,6 +127,10 @@ class Tray(QSystemTrayIcon):
         self.act_ai = self._action("哪儿都没词时用 AI 听写", lambda _: window.toggle_ai(), checkable=True)
         self.act_cal = self._action("按音频自动校准逐字时间", lambda _: window.toggle_calibrate(), checkable=True)
         self.act_sync = self._action("拖进度条后听声音自动对时", self._toggle_sync, checkable=True)
+        if not window.worker.available:              # packaged build without the AI parts
+            for act in (self.act_ai, self.act_cal):
+                act.setEnabled(False)
+                act.setText(act.text() + "（这个版本没有）")
         theme_menu = menu.addMenu("配色")
         theme_menu.aboutToShow.connect(lambda: window.fill_theme_menu(theme_menu))
         menu.addSeparator()
@@ -200,7 +209,83 @@ class Tray(QSystemTrayIcon):
             self.w.cfg.save()
 
 
+def log_crashes():
+    """Unhandled errors go to data/crash.log (a packaged build has no console to show them)."""
+    import traceback
+
+    def hook(kind, value, tb):
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(os.path.join(DATA_DIR, "crash.log"), "a", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + "".join(traceback.format_exception(kind, value, tb)) + "\n")
+        except OSError:
+            pass
+        sys.__excepthook__(kind, value, tb)
+    sys.excepthook = hook
+
+
+def install(target_dir=None):
+    """`--install`: put a shortcut on the desktop (or in target_dir) and the icon next to the app."""
+    app = QApplication(sys.argv)
+    os.makedirs(DATA_DIR, exist_ok=True)
+    icon_path = os.path.join(DATA_DIR, "icon.ico")
+    make_icon().save(icon_path, "ICO")
+    if target_dir is None:
+        import win32com.client
+        target_dir = win32com.client.Dispatch("WScript.Shell").SpecialFolders("Desktop")
+    write_shortcut(os.path.join(target_dir, SHORTCUT_NAME), icon_path)
+    del app
+    return 0
+
+
+def selftest():
+    """`--selftest`: check the parts a friend's PC needs and write data/selftest.log (no lyrics in it)."""
+    out = []
+
+    def check(name, fn):
+        try:
+            out.append(f"OK   {name}: {fn()}")
+        except Exception as e:
+            out.append(f"FAIL {name}: {type(e).__name__}: {e}")
+
+    reader = NcmReader()
+    time.sleep(1.5)
+    state, song, duration, pos = reader.snapshot()
+    out.append(f"INFO NetEase: {state}, song id {'yes' if song else 'none'}, {pos:.1f}s / {duration:.0f}s")
+
+    def decode():
+        import audiosync
+        if not song.isdigit():
+            return "no song to decode (play one and rerun)"
+        ref = audiosync.load_reference(song, duration, lambda: False, timeout=20)
+        return "not cached yet" if ref is None else f"cached song decoded, {len(ref) / audiosync.FS:.0f}s"
+
+    def loopback():
+        import soundcard as sc
+        devices = [m for m in sc.all_microphones(include_loopback=True) if m.isloopback]
+        return f"{len(devices)} loopback device(s), default speaker '{sc.default_speaker().name}'"
+
+    def lyric_api():
+        import lyrics
+        return f"{len(lyrics.netease_lyrics(song, lyrics.song_meta(song)).lines)} lines" if song.isdigit() else "skipped"
+
+    check("decode cached audio (PyAV)", decode)
+    check("speaker loopback (soundcard)", loopback)
+    check("NetEase lyric API", lyric_api)
+    reader.stop()
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(os.path.join(DATA_DIR, "selftest.log"), "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+    return 0
+
+
 def main():
+    log_crashes()
+    if "--selftest" in sys.argv:
+        return selftest()
+    if "--install" in sys.argv:
+        i = sys.argv.index("--install")
+        return install(sys.argv[i + 1] if i + 1 < len(sys.argv) else None)
     ctypes.windll.winmm.timeBeginPeriod(1)
     sys.setswitchinterval(0.001)     # background threads hand the UI thread its turn sooner
     app = QApplication(sys.argv)

@@ -19,6 +19,7 @@ import time
 import numpy as np
 
 import transcribe
+from config import DATA_DIR
 
 FS = 8000              # matching sample rate
 REC_RATE = 48000
@@ -29,7 +30,7 @@ PERIOD = 30.0          # routine re-check while playing
 SETTLE = 1.0           # after a seek NetEase restarts the sound late: let it settle first
 RETRY = 4.0            # after a failed check
 XOR_TABLE = bytes(b ^ 0xA3 for b in range(256))
-LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "sync.log")
+LOG = os.path.join(DATA_DIR, "sync.log")
 
 
 def _log(text):
