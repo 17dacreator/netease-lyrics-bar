@@ -8,7 +8,7 @@ timed from the player's own playback position. UI and docs are in Chinese.
 
 ## 下载安装（不用装 Python）
 
-1. 到 [Releases](../../releases) 下载 `网易云桌面歌词.zip`，解压到一个固定的地方。
+1. 到 [Releases](../../releases) 下载最新版的 zip，解压到一个固定的地方。
 2. 双击里面的「安装.bat」：桌面出现「网易云桌面歌词」，歌词条自动打开。
 3. 需要：Windows 10 / 11，网易云音乐电脑版 3.x（太旧的版本读不到进度，先更新网易云）。
 
