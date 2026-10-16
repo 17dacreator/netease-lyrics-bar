@@ -1,6 +1,37 @@
-# 网易云桌面歌词
+# 网易云桌面歌词 (netease-lyrics-bar)
 
-自己做的网易云音乐（PC 3.x）桌面歌词：透明、置顶、可鼠标穿透，偏移能按 0.01 秒微调。
+给网易云音乐电脑版（3.x）用的桌面歌词条：透明、置顶、可鼠标穿透，偏移能按 0.01 秒微调。
+直接读网易云自己的播放进度，所以比靠猜进度的歌词软件准；拖进度条后还会听一下扬声器的声音自动对准。
+
+A transparent, always-on-top lyric bar for the NetEase Cloud Music desktop client (3.x, Windows),
+timed from the player's own playback position. UI and docs are in Chinese.
+
+## 下载安装（不用装 Python）
+
+1. 到 [Releases](../../releases) 下载 `网易云桌面歌词.zip`，解压到一个固定的地方。
+2. 双击里面的「安装.bat」：桌面出现「网易云桌面歌词」，歌词条自动打开。
+3. 需要：Windows 10 / 11，网易云音乐电脑版 3.x（太旧的版本读不到进度，先更新网易云）。
+
+打包版不带「按声音校准每个字」和「AI 听写」（要 NVIDIA 显卡和几 GB 模型），其它功能都有。
+它要读网易云的播放进度，个别杀毒软件会报，选允许即可。出问题时运行 `NeteaseLyrics.exe --selftest`，
+把 `data\selftest.log`（和 `data\crash.log`）发出来。
+
+## 从源码运行
+
+```bat
+py -m pip install -r requirements.txt
+pythonw main.pyw
+```
+
+想要校准和 AI 听写：先按 `requirements-ai.txt` 里的说明装 PyTorch，再 `py -m pip install -r requirements-ai.txt`。
+自己打包：`py build_release.py`（会在桌面生成 zip，并拒绝把 `data/` 里的设置、歌词缓存、日志打进去）。
+
+## 说明
+
+- 非网易云官方软件，跟网易云没有关系。
+- 歌词是播放时从公开接口（网易云、LRCLIB、QQ 音乐）现取、只缓存在你自己电脑的 `data/` 里，仓库和安装包里都不带任何歌词。
+- 定位播放进度的特征码来自 [Kxnrl/NetEase-Cloud-Music-DiscordRPC](https://github.com/Kxnrl/NetEase-Cloud-Music-DiscordRPC)（MIT）。
+- 本项目以 MIT 协议开源，见 `LICENSE`。
 
 ## 用法
 

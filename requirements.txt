@@ -1,0 +1,7 @@
+# The lyric bar itself (everything except calibration / AI transcription)
+PySide6-Essentials
+requests
+pywin32
+soundcard
+av
+numpy

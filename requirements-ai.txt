@@ -1,0 +1,5 @@
+# Optional: calibration by sound and AI transcription (NVIDIA GPU, several GB).
+# Install PyTorch for your CUDA first, e.g. for RTX 50-series:
+#   py -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+demucs
+faster-whisper
