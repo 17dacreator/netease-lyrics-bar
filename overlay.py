@@ -7,11 +7,12 @@ import threading
 import time
 from collections import OrderedDict
 
-from PySide6.QtCore import Qt, QObject, QTimer, QRect, QRectF, QPointF, Signal
+from PySide6.QtCore import Qt, QObject, QTimer, QRect, QRectF, QPoint, QPointF, QEvent, Signal
 from PySide6.QtGui import (QPainter, QPainterPath, QFont, QFontMetricsF, QColor, QPen, QLinearGradient,
                            QCursor, QGuiApplication, QImage)
 from PySide6.QtGui import QIcon, QPixmap
-from PySide6.QtWidgets import QWidget, QPushButton, QHBoxLayout, QMenu, QColorDialog, QProxyStyle, QStyle
+from PySide6.QtWidgets import (QWidget, QPushButton, QHBoxLayout, QMenu, QColorDialog, QProxyStyle, QStyle,
+                               QLabel)
 
 import lyrics as lyr
 from worker_client import WorkerClient
@@ -198,11 +199,73 @@ class UnlockBubble(QWidget):
                          | Qt.WindowDoesNotAcceptFocus)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
-        btn = QPushButton("解锁", self)
+        btn = self.button = QPushButton("解锁", self)
         btn.setStyleSheet(BUTTON_CSS + "QPushButton { background: rgba(20,20,24,200); padding: 5px 12px; }")
         btn.clicked.connect(self.clicked)
         btn.adjustSize()
         self.resize(btn.size())
+
+
+TIP_DELAY = 700               # ms the pointer rests on a button before its description shows
+TIP_CSS = """
+QLabel { color: #f2f2f2; background: rgba(26,26,32,242); border: 1px solid rgba(255,255,255,45);
+         border-radius: 7px; padding: 4px 10px; font: 13px "Microsoft YaHei UI"; }
+"""
+
+
+class HoverTip(QWidget):
+    """A short description just above a button the pointer rests on.
+
+    Qt's own tooltips only appear over the active window, and the lyric window never
+    takes focus, so they never showed.
+    """
+
+    def __init__(self):
+        super().__init__(None, Qt.ToolTip | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+                         | Qt.WindowDoesNotAcceptFocus)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.label = QLabel(self)
+        self.label.setStyleSheet(TIP_CSS)
+        self._target = None
+        self._timer = QTimer(self, singleShot=True, interval=TIP_DELAY, timeout=self._show_now)
+
+    def watch(self, button, text):
+        button.setProperty("tip", text)
+        button.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        kind = event.type()
+        if kind == QEvent.Enter:
+            self._target = obj
+            self.hide()
+            self._timer.start()
+        elif kind in (QEvent.Leave, QEvent.MouseButtonPress, QEvent.Hide) and obj is self._target:
+            self._timer.stop()
+            self._target = None
+            self.hide()
+        return False
+
+    def _show_now(self):
+        b = self._target
+        if b is None or not b.isVisible() or not b.rect().contains(b.mapFromGlobal(QCursor.pos())):
+            return
+        text = b.property("tip")
+        if not text:
+            return
+        self.label.setText(text)
+        self.label.adjustSize()
+        self.resize(self.label.size())
+        corner = b.mapToGlobal(QPoint(0, 0))
+        area = b.screen().availableGeometry()
+        x = corner.x() + (b.width() - self.width()) // 2
+        y = corner.y() - self.height() - 6              # above the button, clear of the lyrics
+        if y < area.top():
+            y = corner.y() + b.height() + 6
+        self.move(max(area.left() + 4, min(x, area.right() - self.width() - 4)), y)
+        self.show()
+        user32.SetWindowPos(int(self.winId()), wt.HWND(-1), 0, 0, 0, 0, 0x13)
 
 
 class LyricWindow(QWidget):
@@ -248,9 +311,11 @@ class LyricWindow(QWidget):
         self._shapes = OrderedDict()
         self._bounds_key, self._bounds_val = None, []
 
+        self.tip = HoverTip()
         self._build_toolbar()
         self.bubble = UnlockBubble()
         self.bubble.clicked.connect(lambda: self.set_locked(False))
+        self.tip.watch(self.bubble.button, "解除锁定")
         self.bubble.winId()           # create the native window now so the first show is instant
 
         self._save_timer = QTimer(self, singleShot=True, interval=400, timeout=self.cfg.save)
@@ -277,7 +342,7 @@ class LyricWindow(QWidget):
 
         def button(text, tip, slot, checkable=False, name=None, cls=QPushButton):
             b = cls(text, bar)
-            b.setToolTip(tip)
+            self.tip.watch(b, tip)
             b.setCursor(Qt.PointingHandCursor)
             b.setFocusPolicy(Qt.NoFocus)
             b.setCheckable(checkable)
@@ -289,37 +354,38 @@ class LyricWindow(QWidget):
 
         # subtitle style
         self.trans_btn = button("译", "显示翻译", self.toggle_trans, checkable=True)
-        self.next_btn = button("下句", "在下面显示下一句歌词", self.toggle_next, checkable=True)
-        self.reveal_btn = button("逐词", "歌词一个词一个词地出来", self.toggle_reveal, checkable=True)
-        self.sweep_btn = button("渐变", "唱到哪里，白字就从左到右变成主题色", self.toggle_sweep, checkable=True)
-        self.gap_btn = button("间奏", "超过 10 秒没人唱时标出「前奏 / 间奏 / 尾奏」", self.toggle_gap, checkable=True)
-        button("A−", "字小一点", lambda: self.change_font(-2))
-        button("A+", "字大一点", lambda: self.change_font(2))
-        self.theme_btn = button("配色 ▾", "选歌词颜色", lambda: None)
+        self.next_btn = button("下句", "显示下句歌词", self.toggle_next, checkable=True)
+        self.reveal_btn = button("逐词", "歌词逐词出现", self.toggle_reveal, checkable=True)
+        self.sweep_btn = button("渐变", "按演唱进度变色", self.toggle_sweep, checkable=True)
+        self.gap_btn = button("间奏", "标出前奏间奏尾奏", self.toggle_gap, checkable=True)
+        button("A−", "字体调小", lambda: self.change_font(-2))
+        button("A+", "字体调大", lambda: self.change_font(2))
+        self.theme_btn = button("配色 ▾", "选择歌词颜色", lambda: None)
         self.theme_menu = styled_menu(self.theme_btn)
         self.theme_menu.aboutToShow.connect(lambda: self.fill_theme_menu(self.theme_menu))
         self.theme_btn.setMenu(self.theme_menu)
         row.addStretch(1)
         # functions
-        button("−0.1", "歌词推迟 0.1 秒", lambda: self.adjust_offset(-0.1))
-        button("−0.01", "歌词推迟 0.01 秒", lambda: self.adjust_offset(-0.01))
-        self.offset_btn = button("", "滚轮 ±0.01 秒（按住 Shift ±0.1）· 右键归零", lambda: None,
-                                 name="offset", cls=OffsetButton)
+        button("−0.1", "歌词推迟0.1秒", lambda: self.adjust_offset(-0.1))
+        button("−0.01", "歌词推迟0.01秒", lambda: self.adjust_offset(-0.01))
+        self.offset_btn = button("", "滚轮微调 右键归零", lambda: None, name="offset", cls=OffsetButton)
         self.offset_btn.nudge.connect(self.adjust_offset)
         self.offset_btn.reset.connect(self.reset_offset)
-        button("+0.01", "歌词提前 0.01 秒", lambda: self.adjust_offset(0.01))
-        button("+0.1", "歌词提前 0.1 秒", lambda: self.adjust_offset(0.1))
-        self.scope_btn = button("", "点一下切换：调全部歌曲 / 只调这首", self.toggle_scope)
+        button("+0.01", "歌词提前0.01秒", lambda: self.adjust_offset(0.01))
+        button("+0.1", "歌词提前0.1秒", lambda: self.adjust_offset(0.1))
+        self.scope_btn = button("", "", self.toggle_scope)
         self.find_btn = button("找词", "", self.find_lyrics_now)
-        button("校准", "逐字对不上时点这里：按这首歌的声音重新对齐每个字", self.calibrate_now)
-        self.lock_btn = button("锁定", "锁定后鼠标可以穿透歌词", lambda: self.set_locked(True))
-        button("✕", "隐藏歌词（托盘图标里可以再打开）", self.hide_by_user)
+        button("校准", "按声音对齐每个字" if self.worker.available else "这个版本没有校准", self.calibrate_now)
+        self.lock_btn = button("锁定", "锁定歌词位置并隐藏其他按钮", lambda: self.set_locked(True))
+        button("✕", "隐藏歌词", self.hide_by_user)
         bar.hide()
         self._refresh_toolbar()
 
     def _refresh_toolbar(self):
         self.offset_btn.setText(fmt_offset(self._scope_value()))
-        self.scope_btn.setText("全部歌曲" if self.cfg["scope"] == "all" else "只调这首")
+        every = self.cfg["scope"] == "all"
+        self.scope_btn.setText("全部歌曲" if every else "只调这首")
+        self.scope_btn.setProperty("tip", "偏移对所有歌生效" if every else "偏移只对这首生效")
         self.trans_btn.setChecked(bool(self.cfg["show_trans"]))
         self.next_btn.setChecked(bool(self.cfg["show_next"]))
         self.gap_btn.setChecked(self.cfg["gap_label"] != "off")
@@ -327,8 +393,7 @@ class LyricWindow(QWidget):
         self.sweep_btn.setChecked(bool(self.cfg["sweep"]))
         filled = bool(self.lyrics and self.lyrics.lines and self.lyrics.source != "网易云")
         self.find_btn.setText("撤词" if filled else "找词")
-        self.find_btn.setToolTip("这首的歌词是「找词」补来的，对不上就点这里撤掉" if filled else
-                                 "这首没有歌词时点这里：去别的歌词库找，听过这首歌、对得上才填")
+        self.find_btn.setProperty("tip", "撤掉找来的歌词" if filled else "给没词的歌找歌词")
 
     # -- offsets -----------------------------------------------------------
 
