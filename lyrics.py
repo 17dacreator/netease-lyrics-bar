@@ -10,9 +10,6 @@ import html
 import json
 import os
 import re
-import subprocess
-import sys
-import threading
 import time
 from dataclasses import dataclass, field
 
@@ -32,9 +29,7 @@ LRCLIB_GET = "https://lrclib.net/api/get"
 LRCLIB_SEARCH = "https://lrclib.net/api/search"
 QQ_SEARCH = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp"
 QQ_LYRIC = "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg"
-AI_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transcribe.py")
-ALIGN_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "align.py")
-AI_TIMEOUT = 600             # seconds; the first run also downloads the models
+AI_TIMEOUT = 600             # seconds to wait for a transcription (first run loads the models)
 MISS_TTL = 3 * 24 * 3600     # re-check songs without lyrics after a few days
 DURATION_SLACK = 3.0         # seconds a fallback version may differ from the playing one
 
@@ -380,6 +375,18 @@ def _from_qq(meta):
 FALLBACKS = [("网易云其他版本", _from_netease_versions), ("LRCLIB", _from_lrclib), ("QQ音乐", _from_qq)]
 
 
+PLACEHOLDER = re.compile(r"纯音乐|请欣赏|请您欣赏|instrumental|no lyrics", re.I)
+
+
+def _real_lyrics(api):
+    """Synced lines that are actual lyrics, not a one-line "instrumental, please enjoy" placeholder
+    (QQ Music answers instrumentals that way)."""
+    texts = [ln.text for ln in build(api).lines if ln.text.strip()]
+    if len(texts) < 3:
+        return False
+    return not (len(texts) <= 5 and any(PLACEHOLDER.search(t) for t in texts))
+
+
 def find_elsewhere(song_id, meta):
     """(api_like_dict, source_name) from the first fallback that has synced lyrics, else (None, None)."""
     path = os.path.join(CACHE_DIR, f"{song_id}.alt.json")
@@ -398,6 +405,8 @@ def find_elsewhere(song_id, meta):
         if api:
             if api.get("pureMusic"):
                 break
+            if not _real_lyrics(api):
+                continue
             _write_cache(path, {"source": name, "api": api})
             return api, name
     if errors < len(FALLBACKS):          # only remember a miss if the lookups actually ran
@@ -411,62 +420,52 @@ def _ai_path(song_id):
     return os.path.join(CACHE_DIR, f"{song_id}.ai.json")
 
 
-def load_ai(song_id):
-    """Lyrics from a finished transcription, or None if there is none (or it failed)."""
+def log_error(song_id, text):
+    try:
+        with open(os.path.join(DATA_DIR, "ai_errors.log"), "a", encoding="utf-8") as log:
+            log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {song_id} {text}\n")
+    except OSError:
+        pass
+
+
+def ai_state(song_id):
+    """Earlier AI result: Lyrics, "instrumental" (voice check found no singing), or None."""
     try:
         with open(_ai_path(song_id), encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
         return None
-    if data.get("error"):
+    if data.get("instrumental"):
+        return "instrumental"
+    if data.get("error") or not data.get("lines"):
         return None
     lines = [Line(d["start"], d["end"], "".join(w[2] for w in d["words"]),
-                  [Word(s, e, t) for s, e, t in d["words"]]) for d in data.get("lines") or []]
+                  [Word(s, e, t) for s, e, t in d["words"]]) for d in data["lines"]]
     return Lyrics(lines, word_level=True, source="AI听写")
 
 
-def run_transcription(song_id, meta, on_stage, holder):
-    """Run transcribe.py for one song (blocking) and return its Lyrics, or None.
-
-    `holder` receives the Popen so the caller can kill it when the song changes.
-    """
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    out = _ai_path(song_id)
-    exe = os.path.join(os.path.dirname(sys.executable), "python.exe")
-    script_text = meta["title"] + " " + " ".join(meta["artists"])
-    hint = "ja" if re.search("[\u3040-\u30ff]", script_text) else \
-        "ko" if re.search("[\uac00-\ud7af]", script_text) else \
-        "zh" if re.search("[\u4e00-\u9fff]", script_text) else ""
-    proc = subprocess.Popen([exe if os.path.exists(exe) else sys.executable, AI_SCRIPT,
-                             song_id, str(meta["duration"] or 0), out, hint],
-                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-                            encoding="utf-8", creationflags=subprocess.CREATE_NO_WINDOW)
-    holder.append(proc)
-    timer = threading.Timer(AI_TIMEOUT, proc.kill)
-    timer.start()
-    try:
-        for line in proc.stdout:
-            if line.startswith("STAGE "):
-                on_stage(line[6:].strip())
-        proc.wait()
-    finally:
-        timer.cancel()
-        if proc in holder:
-            holder.remove(proc)
-    try:
-        with open(out, encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        return None
-    if data.get("error"):
-        with open(os.path.join(DATA_DIR, "ai_errors.log"), "a", encoding="utf-8") as log:
-            log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {song_id} {data['error']}\n")
-        os.remove(out)           # let the next play try again
-        return None
-    return load_ai(song_id)
+def save_ai(song_id, result):
+    _write_cache(_ai_path(song_id), result)
 
 
-# -- auto-calibration: word timing from the audio ----------------------------------------
+def forget_misses(song_id):
+    """Drop remembered "no lyrics anywhere" / "instrumental" results so the next look starts fresh."""
+    for path in (os.path.join(CACHE_DIR, f"{song_id}.alt.json"), _ai_path(song_id)):
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def language_hint(meta):
+    """Script of title/artists: kana -> ja, hangul -> ko, han -> zh, else ''."""
+    text = meta["title"] + " " + " ".join(meta["artists"])
+    if re.search("[\u3040-\u30ff]", text):
+        return "ja"
+    if re.search("[\uac00-\ud7af]", text):
+        return "ko"
+    if re.search("[\u4e00-\u9fff]", text):
+        return "zh"
+    return ""
+
 
 def _align_path(song_id):
     return os.path.join(CACHE_DIR, f"{song_id}.align.json")
@@ -495,94 +494,20 @@ def load_alignment(song_id, ly):
     return data
 
 
-SCENES_VERSION = 1
+def alignment_request(ly):
+    """The lines as the worker's align job wants them."""
+    lines = []
+    for ln in ly.lines:
+        units = [w.text for w in ln.words] if ln.words else tokenize(ln.text)
+        item = {"start": ln.start, "text": ln.text, "units": units}
+        if ln.words and not ln.estimated:
+            item["first"] = ln.words[0].start
+        lines.append(item)
+    return lines
 
 
-def _scenes_path(song_id):
-    return os.path.join(CACHE_DIR, f"{song_id}.scenes.json")
-
-
-def load_scenes(song_id):
-    """Cached [[start, end, label], ...] for the 间奏 display, or None."""
-    try:
-        with open(_scenes_path(song_id), encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        return None
-    return data.get("scenes") if data.get("version") == SCENES_VERSION else None
-
-
-def chinese_context(meta, ly=None):
-    """Chinese characters (and no kana) in title/artist/album/lyrics: allow Chinese instrument labels."""
-    text = " ".join([meta["title"], " ".join(meta["artists"]), meta.get("album", "")] +
-                    ([ln.text for ln in ly.lines[:40]] if ly else []))
-    return bool(KANJI.search(text)) and not KANA.search(text)
-
-
-def run_analysis(song_id, meta, ly, want_scenes, on_stage, holder, lyrics_for_context=None):
-    """One background pass over the cached audio (blocking).
-
-    Calibrates `ly` when given and/or labels the instrumental stretches when
-    want_scenes. Returns (alignment data or None, scenes or None); both are cached.
-    """
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    req = "-"
-    if ly is not None:
-        lines = []
-        for ln in ly.lines:
-            units = [w.text for w in ln.words] if ln.words else tokenize(ln.text)
-            item = {"start": ln.start, "text": ln.text, "units": units}
-            if ln.words and not ln.estimated:
-                item["first"] = ln.words[0].start
-            lines.append(item)
-        req = _align_path(song_id) + ".in.json"
-        with open(req, "w", encoding="utf-8") as f:
-            json.dump(lines, f, ensure_ascii=False)
-    out = _align_path(song_id) + ".out.json"
-    flags = []
-    if want_scenes:
-        flags.append("--scenes")
-        if chinese_context(meta, ly or lyrics_for_context):
-            flags.append("--chinese")
-    exe = os.path.join(os.path.dirname(sys.executable), "python.exe")
-    proc = subprocess.Popen([exe if os.path.exists(exe) else sys.executable, ALIGN_SCRIPT,
-                             song_id, str(meta["duration"] or 0), req, out] + flags,
-                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-                            encoding="utf-8", creationflags=subprocess.CREATE_NO_WINDOW)
-    holder.append(proc)
-    timer = threading.Timer(AI_TIMEOUT, proc.kill)
-    timer.start()
-    try:
-        for line in proc.stdout:
-            if line.startswith("STAGE "):
-                on_stage(line[6:].strip())
-        proc.wait()
-    finally:
-        timer.cancel()
-        if proc in holder:
-            holder.remove(proc)
-    try:
-        with open(out, encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        return None, None
-    finally:
-        for p in (req, out):
-            if p != "-" and os.path.exists(p):
-                os.remove(p)
-    if data.get("error"):
-        with open(os.path.join(DATA_DIR, "ai_errors.log"), "a", encoding="utf-8") as log:
-            log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} analyse {song_id} {data['error']}\n")
-        return None, None
-    align = None
-    if ly is not None and data.get("lines"):
-        align = {"lines": data["lines"], "sig": _signature(ly), "elapsed": data.get("elapsed")}
-        _write_cache(_align_path(song_id), align)
-    scenes = None
-    if want_scenes and "scenes" in data:
-        scenes = data["scenes"]
-        _write_cache(_scenes_path(song_id), {"version": SCENES_VERSION, "scenes": scenes})
-    return align, scenes
+def save_alignment(song_id, ly, data):
+    _write_cache(_align_path(song_id), {"lines": data["lines"], "sig": _signature(ly)})
 
 
 def apply_alignment(ly, data):
@@ -618,11 +543,26 @@ def apply_alignment(ly, data):
     return out
 
 
-def fetch_lyrics(song_id, meta, autofill=True):
-    """Lyrics for a numeric song id. Raises on network failure with no cache."""
-    api = netease_api(song_id)
-    ly = build(api, meta["duration"])
-    if ly.lines or ly.pure_music or not autofill:
-        return ly
+def netease_lyrics(song_id, meta):
+    """NetEase's own lyrics. Raises on network failure with no cache."""
+    return build(netease_api(song_id), meta["duration"])
+
+
+def needs_more(ly):
+    """No usable lyrics yet. Songs NetEase marks as instrumental count too: obscure songs
+    get that mark just because nobody uploaded lyrics."""
+    return not ly or not ly.lines or ly.pure_music
+
+
+def fallback_lyrics(song_id, meta):
+    """Lyrics from another library, or None."""
     alt, source = find_elsewhere(song_id, meta)
-    return build(alt, meta["duration"], source) if alt else ly
+    return build(alt, meta["duration"], source) if alt else None
+
+
+def fetch_lyrics(song_id, meta, autofill=True):
+    """NetEase, then the other libraries when NetEase has nothing usable."""
+    ly = netease_lyrics(song_id, meta)
+    if needs_more(ly) and autofill:
+        ly = fallback_lyrics(song_id, meta) or ly
+    return ly

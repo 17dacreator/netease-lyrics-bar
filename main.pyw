@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
 
 from config import Config, DATA_DIR
 from ncm_reader import NcmReader
+from audiosync import AudioSync
 from overlay import LyricWindow, THEMES
 
 INSTANCE_KEY = "ncm-desktop-lyrics-" + os.environ.get("USERNAME", "user")
@@ -120,6 +121,7 @@ class Tray(QSystemTrayIcon):
                                      checkable=True)
         self.act_ai = self._action("哪儿都没词时用 AI 听写", lambda _: window.toggle_ai(), checkable=True)
         self.act_cal = self._action("按音频自动校准逐字时间", lambda _: window.toggle_calibrate(), checkable=True)
+        self.act_sync = self._action("拖进度条后听声音自动对时", self._toggle_sync, checkable=True)
         theme_menu = menu.addMenu("配色")
         self.theme_group = QActionGroup(self)
         for i, (name, *_rest) in enumerate(THEMES):
@@ -164,8 +166,13 @@ class Tray(QSystemTrayIcon):
         self.act_fill.setChecked(cfg["autofill"])
         self.act_ai.setChecked(cfg["ai_transcribe"])
         self.act_cal.setChecked(cfg["calibrate"])
+        self.act_sync.setChecked(cfg["audio_sync"])
         self.theme_group.actions()[cfg["theme"]].setChecked(True)
         self.act_boot.setChecked(os.path.exists(os.path.join(STARTUP_DIR, SHORTCUT_NAME)))
+
+    def _toggle_sync(self, on):
+        self.w.cfg["audio_sync"] = bool(on)
+        self.w.cfg.save()
 
     def _reset_global(self):
         scope = self.w.cfg["scope"]
@@ -224,7 +231,8 @@ def main():
 
     cfg = Config()
     reader = NcmReader()
-    window = LyricWindow(cfg, reader)
+    sync = AudioSync(reader, cfg)
+    window = LyricWindow(cfg, reader, sync)
     hotkeys = HotkeyFilter(window)
     app.installNativeEventFilter(hotkeys)
     tray = Tray(window, hotkeys, icon, icon_path)
@@ -246,6 +254,8 @@ def main():
         cfg.save()
     code = app.exec()
     window.stop_ai()
+    window.worker.stop()
+    sync.stop()
     reader.stop()
     cfg.save()
     return code

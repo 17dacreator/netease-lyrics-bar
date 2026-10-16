@@ -10,10 +10,10 @@ from collections import OrderedDict
 from PySide6.QtCore import Qt, QTimer, QRect, QRectF, QPointF, Signal
 from PySide6.QtGui import (QPainter, QPainterPath, QFont, QFontMetricsF, QColor, QPen, QLinearGradient,
                            QCursor, QGuiApplication, QImage)
-from PySide6.QtGui import QActionGroup
-from PySide6.QtWidgets import QWidget, QPushButton, QHBoxLayout, QMenu
+from PySide6.QtWidgets import QWidget, QPushButton, QHBoxLayout
 
 import lyrics as lyr
+from worker_client import WorkerClient
 
 user32 = ctypes.windll.user32
 user32.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wt.UINT]
@@ -27,10 +27,18 @@ FONT_FAMILY = "Microsoft YaHei UI"
 TOOLBAR_H = 38
 EDGE = 8
 FONT_MIN, FONT_MAX = 18, 72
+NOTES = {
+    "failed": "歌词加载失败，稍后自动重试", "none": "暂无歌词", "pure": "纯音乐",
+    "search": "正在别的歌词库找歌词…",
+    "ai:audio": "AI 听写：等网易云把这首歌缓存好…", "ai:vocals": "AI 听写：分离人声…",
+    "ai:words": "AI 听写：识别歌词…", "ai_failed": "暂无歌词（AI 听写没成功）",
+    "pure:search": "网易云标的是纯音乐，先去别的歌词库找找…",
+    "pure:ai:audio": "纯音乐？等缓存好了听听有没有人唱…",
+    "pure:ai:vocals": "纯音乐？正在听有没有人唱…",
+    "pure:ai:words": "听到有人唱，AI 听写中…",
+}
 REVEAL_FADE = 0.09            # seconds a newly revealed word takes to fade in
 GAP_MIN = 4.0                 # seconds without singing before a stretch gets a 间奏 label
-GAP_MODES = [("off", "不显示"), ("simple", "只标「前奏 / 间奏 / 尾奏」"),
-             ("detail", "标出在响什么（人声采样、贝斯独奏、唢呐…）")]
 
 # name, sung gradient (top, bottom), unsung colour
 THEMES = [
@@ -47,7 +55,6 @@ QPushButton { color: #f4f4f4; background: rgba(255,255,255,30); border: none; bo
 QPushButton:hover { background: rgba(255,255,255,70); }
 QPushButton:checked { background: rgba(255,70,105,170); }
 QPushButton#offset { min-width: 104px; font-weight: bold; background: rgba(255,255,255,48); }
-QPushButton::menu-indicator { width: 0; }
 """
 
 
@@ -96,13 +103,12 @@ class LyricWindow(QWidget):
     changed = Signal()            # lock / visibility / theme / translation toggled
     hidden_by_user = Signal()
     _fetched = Signal(int, str, object, str, str)
-    _calib_status = Signal(str)
-    _scenes_ready = Signal(int, object)
+    _calib_event = Signal(int, object, object, str, bool)
 
-    def __init__(self, cfg, reader):
+    def __init__(self, cfg, reader, sync=None):
         super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
                          | Qt.WindowDoesNotAcceptFocus)
-        self.cfg, self.reader = cfg, reader
+        self.cfg, self.reader, self.sync = cfg, reader, sync
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setMouseTracking(True)
@@ -113,10 +119,11 @@ class LyricWindow(QWidget):
         self.lyrics = None
         self.fetch_state = ""         # loading | ok | failed | none
         self._fetch_gen = 0
-        self._ai_procs = []
-        self._calib_status.connect(self._on_calib_status)
-        self.scenes = None            # [[start, end, label]] for the 间奏 display
-        self._scenes_ready.connect(self._on_scenes)
+        self.worker = WorkerClient()   # models stay loaded between songs (worker.py)
+        self._jobs = []               # this song's background jobs
+        self._calib_job = None
+        self._calib_announced = False
+        self._calib_event.connect(self._on_calib_event)
         self._fetched.connect(self._on_fetched)
 
         self.hovered = False
@@ -164,16 +171,7 @@ class LyricWindow(QWidget):
         self.next_btn = button("下句", "在下面显示下一句歌词", self.toggle_next, checkable=True)
         self.reveal_btn = button("逐词", "歌词一个词一个词地出来", self.toggle_reveal, checkable=True)
         self.sweep_btn = button("渐变", "唱到哪里，白字就从左到右变成主题色", self.toggle_sweep, checkable=True)
-        self.gap_btn = button("间奏 ▾", "没人唱的时候显示什么", lambda: None, checkable=True)
-        gap_menu = QMenu(self.gap_btn)
-        self.gap_group = QActionGroup(gap_menu)
-        for mode, label in GAP_MODES:
-            act = gap_menu.addAction(label)
-            act.setCheckable(True)
-            act.setData(mode)
-            act.triggered.connect(lambda _=False, m=mode: self.set_gap_label(m))
-            self.gap_group.addAction(act)
-        self.gap_btn.setMenu(gap_menu)
+        self.gap_btn = button("间奏", "没人唱的时候标出「前奏 / 间奏 / 尾奏」", self.toggle_gap, checkable=True)
         button("A−", "字小一点", lambda: self.change_font(-2))
         button("A+", "字大一点", lambda: self.change_font(2))
         button("配色", "换一套颜色", self.next_theme)
@@ -188,7 +186,8 @@ class LyricWindow(QWidget):
         button("+0.01", "歌词提前 0.01 秒", lambda: self.adjust_offset(0.01))
         button("+0.1", "歌词提前 0.1 秒", lambda: self.adjust_offset(0.1))
         self.scope_btn = button("", "点一下切换：调全部歌曲 / 只调这首", self.toggle_scope)
-        button("校准", "按这首歌的音频重新对齐每个字的时间", self.calibrate_now)
+        button("找词", "这首没有歌词时点这里：去别的歌词库找，找不到就用 AI 听写", self.find_lyrics_now)
+        button("校准", "逐字对不上时点这里：按这首歌的声音重新对齐每个字", self.calibrate_now)
         self.lock_btn = button("锁定", "锁定后鼠标可以穿透歌词", lambda: self.set_locked(True))
         button("✕", "隐藏歌词（托盘图标里可以再打开）", self.hide_by_user)
         bar.hide()
@@ -200,8 +199,6 @@ class LyricWindow(QWidget):
         self.trans_btn.setChecked(bool(self.cfg["show_trans"]))
         self.next_btn.setChecked(bool(self.cfg["show_next"]))
         self.gap_btn.setChecked(self.cfg["gap_label"] != "off")
-        for act in self.gap_group.actions():
-            act.setChecked(act.data() == self.cfg["gap_label"])
         self.reveal_btn.setChecked(bool(self.cfg["reveal"]))
         self.sweep_btn.setChecked(bool(self.cfg["sweep"]))
 
@@ -253,26 +250,15 @@ class LyricWindow(QWidget):
     def toggle_trans(self):
         self.cfg["show_trans"] = not self.cfg["show_trans"]
         self._refresh_toolbar()
+        self._relayout()
         self._save_timer.start()
         self.changed.emit()
 
-    def set_gap_label(self, mode):
-        self.cfg["gap_label"] = mode
+    def toggle_gap(self):
+        self.cfg["gap_label"] = "off" if self.cfg["gap_label"] != "off" else "simple"
         self._refresh_toolbar()
         self._save_timer.start()
-        self.changed.emit()
         self._force_paint = True
-        if mode == "detail" and self.song_id.isdigit() and self.scenes is None and not self._ai_procs:
-            gen, song_id, title, ly = self._fetch_gen, self.song_id, self.title, self.lyrics
-
-            def work():                 # switched on mid-song: label this one in the background
-                cached = lyr.load_scenes(song_id)
-                if cached is not None:
-                    self._scenes_ready.emit(gen, cached)
-                    return
-                meta = lyr.song_meta(song_id)
-                self._analyse(gen, song_id, None, title, meta, True, quiet=True, context=ly)
-            threading.Thread(target=work, daemon=True).start()
 
     def toggle_sweep(self):
         self.cfg["sweep"] = not self.cfg["sweep"]
@@ -297,18 +283,16 @@ class LyricWindow(QWidget):
     def toggle_next(self):
         self.cfg["show_next"] = not self.cfg["show_next"]
         self._refresh_toolbar()
+        self._relayout()
         self._save_timer.start()
         self.changed.emit()
 
     def change_font(self, delta):
         size = max(FONT_MIN, min(FONT_MAX, self.cfg["font_size"] + delta))
         if size != self.cfg["font_size"]:
-            bottom = self.y() + self.height()
             self.cfg["font_size"] = size
             self._shapes.clear()
-            self.setFixedHeight(self._calc_height())
-            self.move(self.x(), bottom - self.height())
-            self._layout_toolbar()
+            self._relayout()
             self._save_timer.start()
 
     def next_theme(self):
@@ -369,15 +353,25 @@ class LyricWindow(QWidget):
     def _sub_size(self):
         return max(14, round(self.cfg["font_size"] * 0.6))
 
-    def _calc_height(self):
-        fs = self.cfg["font_size"]
-        return int(TOOLBAR_H + fs * 1.5 + self._sub_size() * 1.6 + 12)
+    def _next_size(self):
+        return max(13, round(self.cfg["font_size"] * 0.5))
 
-    def _rows(self):
-        fs = self.cfg["font_size"]
-        top1 = TOOLBAR_H + 2
-        h1 = fs * 1.5
-        return (top1, h1), (top1 + h1, self._sub_size() * 1.6)
+    def _row_height(self, role):
+        return self._sub_size() * 1.45 if role == "sub" else self._next_size() * 1.5
+
+    def _calc_height(self):
+        """Current line + one row per thing switched on under it (translation, next line)."""
+        under = [r for r, on in (("sub", self.cfg["show_trans"]), ("next", self.cfg["show_next"])) if on]
+        under = under or ["sub"]          # notes like 纯音乐 / 暂无歌词 still need a row
+        return int(TOOLBAR_H + self.cfg["font_size"] * 1.5 + sum(self._row_height(r) for r in under) + 8)
+
+    def _relayout(self):
+        """New height for the rows switched on; the bottom edge stays where the user put it."""
+        bottom = self.y() + self.height()
+        self.setFixedHeight(self._calc_height())
+        self.move(self.x(), bottom - self.height())
+        self._layout_toolbar()
+        self._force_paint = True
 
     def _apply_geometry(self, initial=False):
         h = self._calc_height()
@@ -450,8 +444,11 @@ class LyricWindow(QWidget):
     # -- song / lyric loading ------------------------------------------------
 
     def stop_ai(self):
-        for proc in list(self._ai_procs):
-            proc.kill()
+        """Cancel this song's background jobs (calibration, transcription)."""
+        for jid in self._jobs:
+            self.worker.cancel(jid)
+        self._jobs.clear()
+        self._calib_job = None
 
     def toggle_calibrate(self):
         self.cfg["calibrate"] = not self.cfg["calibrate"]
@@ -462,24 +459,38 @@ class LyricWindow(QWidget):
         self.cfg["ai_transcribe"] = not self.cfg["ai_transcribe"]
         self._save_timer.start()
         self.changed.emit()
-        if self.cfg["ai_transcribe"] and self.song_id and self.fetch_state == "none":
+        if self.cfg["ai_transcribe"] and self.song_id and self.fetch_state in ("none", "pure"):
             _, _, duration, _ = self.reader.snapshot()
             self._load_song(self.song_id, duration)
 
-    def _load_song(self, song_id, duration):
-        self.stop_ai()               # the listener moved on; don't burn the GPU on the old song
+    def find_lyrics_now(self):
+        """Look again from scratch: other libraries, then AI transcription (even if marked instrumental)."""
+        if not self.song_id.isdigit():
+            self.toast("现在没在放歌")
+            return
+        ly = self.lyrics
+        if ly and ly.lines and not ly.pure_music and ly.source != "AI听写":
+            self.toast("这首已经有歌词了")
+            return
+        lyr.forget_misses(self.song_id)
+        _, _, duration, _ = self.reader.snapshot()
+        self._load_song(self.song_id, duration, force=True)
+
+    def _load_song(self, song_id, duration, force=False):
+        self.stop_ai()               # the listener moved on; don't spend the GPU on the old song
         self.song_id, self.title, self.lyrics = song_id, "", None
-        self.scenes = None
         self._fetch_gen += 1
         self._refresh_toolbar()
         if not song_id:
             self.fetch_state = ""
             return
         self.fetch_state = "loading"
+        if song_id.isdigit() and (self.cfg["calibrate"] or self.cfg["ai_transcribe"]):
+            self.worker.submit({"job": "warm"})        # load the models while the lyrics download
         gen = self._fetch_gen
-        threading.Thread(target=self._fetch_worker, args=(gen, song_id, duration), daemon=True).start()
+        threading.Thread(target=self._fetch_worker, args=(gen, song_id, duration, force), daemon=True).start()
 
-    def _fetch_worker(self, gen, song_id, duration):
+    def _fetch_worker(self, gen, song_id, duration, force=False):
         meta = lyr.song_meta(song_id)
         if duration and not meta["duration"]:
             meta["duration"] = duration
@@ -488,28 +499,34 @@ class LyricWindow(QWidget):
             self._fetched.emit(gen, song_id, None, title, "none")
             return
         try:
-            ly = lyr.fetch_lyrics(song_id, meta, autofill=self.cfg["autofill"])
-            state = "ok" if ly.lines else "none"
+            ly = lyr.netease_lyrics(song_id, meta)
         except Exception:
-            ly, state = None, "failed"
-        if state == "none" and not ly.pure_music and self.cfg["ai_transcribe"]:
-            ai = lyr.load_ai(song_id)
-            if ai is None and gen == self._fetch_gen:
-                self._fetched.emit(gen, song_id, None, title, "ai:audio")
-                ai = lyr.run_transcription(
-                    song_id, meta,
-                    lambda st: self._fetched.emit(gen, song_id, None, title, "ai:" + st),
-                    self._ai_procs)
-                if ai is None:
+            self._fetched.emit(gen, song_id, None, title, "failed")
+            return
+        marked_pure = ly.pure_music
+        pre = "pure:" if marked_pure else ""
+        if lyr.needs_more(ly) and self.cfg["autofill"]:
+            self._fetched.emit(gen, song_id, None, title, pre + "search")
+            try:
+                ly = lyr.fallback_lyrics(song_id, meta) or ly
+            except Exception:
+                pass
+        state = "ok"
+        if lyr.needs_more(ly) and self.cfg["ai_transcribe"] and gen == self._fetch_gen:
+            known = lyr.ai_state(song_id)
+            if isinstance(known, lyr.Lyrics):
+                ly = known
+            elif known != "instrumental":
+                # A song marked instrumental is first checked for a voice; "找词" skips that check.
+                result = self._transcribe(gen, song_id, title, meta, marked_pure and not force, pre)
+                if gen != self._fetch_gen:
+                    return
+                if isinstance(result, lyr.Lyrics):
+                    ly = result
+                elif result is None:
                     state = "ai_failed"
-            if ai and ai.lines:
-                ly, state = ai, "ok"
-        want_scenes = self.cfg["gap_label"] == "detail" and song_id.isdigit()
-        if want_scenes:
-            cached_scenes = lyr.load_scenes(song_id)
-            if cached_scenes is not None:
-                self._scenes_ready.emit(gen, cached_scenes)
-                want_scenes = False
+        if state == "ok" and lyr.needs_more(ly):
+            state = "pure" if ly.pure_music else "none"
         need_align = False
         if state == "ok" and self.cfg["calibrate"] and lyr.can_calibrate(ly):
             cached = lyr.load_alignment(song_id, ly)
@@ -518,70 +535,93 @@ class LyricWindow(QWidget):
             else:
                 need_align = True
         self._fetched.emit(gen, song_id, ly, title, state)      # show them now, refine below
-        if need_align or want_scenes:
-            self._analyse(gen, song_id, ly if need_align else None, title, meta, want_scenes,
-                          quiet=True, context=ly)
+        if need_align:
+            self._start_calibration(gen, song_id, ly, quiet=True)
 
-    def _analyse(self, gen, song_id, ly, title, meta, want_scenes, quiet, context=None):
-        """Background calibration of `ly` and/or 间奏 labels, from one pass over the audio."""
-        def on_stage(stage):
-            if not quiet and gen == self._fetch_gen:
-                self._calib_status.emit(stage)
-        data, scenes = lyr.run_analysis(song_id, meta, ly, want_scenes, on_stage, self._ai_procs,
-                                        lyrics_for_context=context)
-        if gen != self._fetch_gen:
-            return
-        if scenes is not None:
-            self._scenes_ready.emit(gen, scenes)
-        if ly is not None:
-            if data:
-                self._fetched.emit(gen, song_id, lyr.apply_alignment(ly, data), title, "calibrated")
-            elif not quiet:
-                self._calib_status.emit("failed")
+    def _transcribe(self, gen, song_id, title, meta, check_vocals, pre):
+        """AI transcription on the worker (blocks the fetch thread): Lyrics, "instrumental", or None."""
+        done, box = threading.Event(), {}
 
-    def _on_scenes(self, gen, scenes):
-        if gen == self._fetch_gen:
-            self.scenes = scenes
-            self._force_paint = True
+        def on_event(msg):
+            if "stage" in msg:
+                if gen == self._fetch_gen:
+                    self._fetched.emit(gen, song_id, None, title, f"{pre}ai:{msg['stage']}")
+            else:
+                box.update(msg)
+                done.set()
+
+        self._fetched.emit(gen, song_id, None, title, pre + "ai:audio")
+        jid = self.worker.submit({"job": "transcribe", "song": song_id, "duration": meta["duration"],
+                                  "hint": lyr.language_hint(meta), "check_vocals": check_vocals}, on_event)
+        self._jobs.append(jid)
+        done.wait(lyr.AI_TIMEOUT)
+        result = box.get("done")
+        if result is None:
+            if box.get("error") not in (None, "cancelled"):
+                lyr.log_error(song_id, "transcribe " + box["error"])
+            return None
+        lyr.save_ai(song_id, result)
+        return "instrumental" if result.get("instrumental") else lyr.ai_state(song_id)
+
+    def _start_calibration(self, gen, song_id, ly, quiet):
+        """Align `ly` to the audio on the worker, nearest the listener first; results arrive in batches."""
+        _, _, duration, pos = self.reader.snapshot()
+        merged = [None] * len(ly.lines)
+
+        def on_event(msg):
+            if gen != self._fetch_gen or msg.get("error") == "cancelled":
+                return
+            if "partial" in msg:
+                for k, r in msg["partial"].items():
+                    merged[int(k)] = r
+                self._calib_event.emit(gen, ly, {"lines": list(merged)}, "partial", quiet)
+            elif "done" in msg:
+                lyr.save_alignment(song_id, ly, msg["done"])
+                self._calib_event.emit(gen, ly, msg["done"], "done", quiet)
+            elif "error" in msg:
+                lyr.log_error(song_id, "align " + msg["error"])
+                self._calib_event.emit(gen, ly, None, "failed", quiet)
+
+        jid = self.worker.submit({"job": "align", "song": song_id, "duration": duration,
+                                  "lines": lyr.alignment_request(ly), "focus": pos}, on_event)
+        self._jobs.append(jid)
+        self._calib_job = jid
 
     def calibrate_now(self):
         ly = getattr(self.lyrics, "raw", self.lyrics)
         if not lyr.can_calibrate(ly):
             self.toast("这首没有能校准的歌词")
             return
-        self.stop_ai()
-        gen, song_id, title = self._fetch_gen, self.song_id, self.title
-        _, _, duration, _ = self.reader.snapshot()
-        self.toast("校准中：等缓存…", 30)
+        if self._calib_job is not None:
+            self.worker.cancel(self._calib_job)
+        self._calib_announced = False
+        self.toast("校准中…", 30)
+        self._start_calibration(self._fetch_gen, self.song_id, ly, quiet=False)
 
-        def work():
-            meta = lyr.song_meta(song_id)
-            if duration and not meta["duration"]:
-                meta["duration"] = duration
-            self._analyse(gen, song_id, ly, title, meta, False, quiet=False)
-        threading.Thread(target=work, daemon=True).start()
-
-    def _on_calib_status(self, stage):
-        text = {"audio": "校准中：等缓存…", "vocals": "校准中：分离人声…", "align": "校准中：对齐每个字…",
-                "done": "校准中：整理…", "failed": "校准没成功（这首可能还没缓存好）"}.get(stage)
-        if text:
-            self.toast(text, 3.0 if stage == "failed" else 30)
+    def _on_calib_event(self, gen, raw, data, kind, quiet):
+        if gen != self._fetch_gen:
+            return
+        if data:
+            self.lyrics = lyr.apply_alignment(raw, data)
+            self._force_paint = True
+        if quiet:
+            return
+        if kind == "partial" and not self._calib_announced:
+            self._calib_announced = True
+            self.toast("这几句已经对准了，后面的在后台继续", 2.0)
+        elif kind == "done":
+            self.toast("整首都校准好了", 1.5)
+        elif kind == "failed":
+            self.toast("校准没成功（这首可能还没缓存好）", 2.5)
 
     def _on_fetched(self, gen, song_id, ly, title, state):
         if gen != self._fetch_gen:
             return
-        if state == "calibrated":
-            self.lyrics, state = ly, "ok"
-            self.fetch_state = state
-            self._force_paint = True
-            n = getattr(ly, "calibrated", 0)
-            self.toast(f"已按音频校准 {n} 句的逐字时间" if n else "已校准：原来的时间就对得上", 2.5)
-            return
         self.lyrics, self.title, self.fetch_state = ly, title, state
         self._force_paint = True
-        if ly and ly.lines and ly.source == "AI听写":
-            self.toast("哪儿都没有这首的歌词，已用 AI 听写（可能有听错的地方）", 3.5)
-        elif ly and ly.lines and ly.source != "网易云":
+        if state == "ok" and ly and ly.lines and ly.source == "AI听写":
+            self.toast("没找到现成的歌词，已用 AI 听写（可能有听错的地方）", 3.5)
+        elif state == "ok" and ly and ly.lines and ly.source != "网易云":
             self.toast(f"网易云没有这首的歌词，已从{ly.source}补上", 3.0)
         if state == "failed":
             QTimer.singleShot(15000, lambda: self._retry(gen))
@@ -595,6 +635,8 @@ class LyricWindow(QWidget):
 
     def _tick(self):
         state, song_id, duration, pos = self.reader.snapshot()
+        if self.sync is not None and song_id and song_id == self.sync._song:
+            pos -= self.sync.correction        # NetEase's progress can run off the sound after a seek
         if song_id != self.song_id:
             self._load_song(song_id, duration)
         if not self.isVisible():
@@ -646,14 +688,14 @@ class LyricWindow(QWidget):
         now = time.monotonic()
         wake = 0.05                     # seconds until the picture can next change
         avail = self.width() - 2 * 18
-        size1, size2 = self.cfg["font_size"], self._sub_size()
-        line1 = line2 = None
+        size1 = self.cfg["font_size"]
+        line1, rows = None, []           # rows under the current line: (text or None, "sub"/"next")
         show_panel = self.hovered and not self.cfg["locked"]
         quiet_hint = show_panel  # status text that only appears while hovering
 
         if state == "unsupported":
             line1 = ("读不到网易云的播放进度", "plain", None, 0.0)
-            line2 = ("网易云可能更新了版本，这个工具需要跟着更新", "next")
+            rows = [("网易云可能更新了版本，这个工具需要跟着更新", "sub")]
         elif state in ("no_player", "idle"):
             if quiet_hint:
                 line1 = ("网易云没有打开" if state == "no_player" else "网易云没在放歌", "dim", None, 0.0)
@@ -661,17 +703,10 @@ class LyricWindow(QWidget):
             ly = self.lyrics
             if not ly or not ly.lines or ly.pure_music:
                 line1 = (self.title or "…", "plain", None, 0.0)
-                note = {"failed": "歌词加载失败，稍后自动重试", "none": "暂无歌词",
-                        "ai:audio": "AI 听写：等网易云把这首歌缓存好…",
-                        "ai:vocals": "AI 听写：分离人声…",
-                        "ai:words": "AI 听写：识别歌词…",
-                        "ai:done": "AI 听写：整理中…",
-                        "ai_failed": "暂无歌词（AI 听写没成功）"}.get(self.fetch_state, "")
-                if ly and ly.pure_music:
-                    label = self._scene_at(t) if self.cfg["gap_label"] == "detail" else None
-                    note = f"纯音乐（{label}）" if label else "纯音乐"
-                    wake = min(wake, self._scene_wake(t))
-                line2 = (note, "next") if note else None
+                note = NOTES.get(self.fetch_state, "")
+                if not note and ly and ly.pure_music:
+                    note = "纯音乐"
+                rows = [(note, "sub")] if note else []
             else:
                 i = ly.index_at(t)
                 if i + 1 < len(ly.lines):
@@ -680,32 +715,38 @@ class LyricWindow(QWidget):
                 if not self.cfg["show_next"]:
                     nxt = None
                 cur = ly.lines[i] if i >= 0 else None
+                has_trans = getattr(ly, "_has_trans", None)
+                if has_trans is None:
+                    has_trans = ly._has_trans = any(ln.trans for ln in ly.lines)
+
+                def under(trans):
+                    # The translation row is kept even when this line has none, so the next
+                    # line never jumps between rows within a song.
+                    out = [(trans, "sub")] if self.cfg["show_trans"] and has_trans else []
+                    return out + ([(nxt.text, "next")] if nxt else [])
                 gap, gap_wake = self._gap_at(ly, i, t)
                 wake = min(wake, gap_wake)
                 if gap and not (cur is None and t < 4.0 and self.title):
-                    line1 = (f"（{self._scene_at(t) or gap}）", "dim", None, 0.0)
-                    wake = min(wake, self._scene_wake(t))
-                    line2 = (nxt.text, "next") if nxt else None
+                    line1 = (f"（{gap}）", "dim", None, 0.0)
+                    rows = under(None)
                 elif cur is None:
                     line1 = (self.title or "", "dim", None, 0.0) if self.title else None
-                    line2 = (nxt.text, "next") if nxt else None
+                    rows = under(None)
                 elif not cur.text or (ly.word_level and t > cur.end + 4.0):
-                    line2 = (nxt.text, "next") if nxt else None
+                    rows = under(None)
                 else:
                     line1, line_wake = self._compose_current(cur, t, size1, avail)
                     wake = min(wake, line_wake)
-                    if self.cfg["show_trans"] and cur.trans:
-                        line2 = (cur.trans, "sub")
-                    elif nxt:
-                        line2 = (nxt.text, "next")
+                    rows = under(cur.trans or None)
 
+        toast = None
         if now < self.toast_until:
-            line2 = (self.toast_text, "toast")
+            toast = self.toast_text           # drawn small in the strip above the lyrics
             wake = min(wake, self.toast_until - now)
         self._wake = wake
-        if line2:
-            line2 = (self._elide(line2[0], size2, avail), line2[1])
-        return (line1, line2, state == "paused", show_panel, self.cfg["locked"], self.width())
+        rows = tuple((self._elide(text, self._sub_size() if role == "sub" else self._next_size(), avail)
+                      if text else None, role) for text, role in rows)
+        return (line1, rows, toast, state == "paused", show_panel, self.cfg["locked"], self.width())
 
     def _compose_current(self, cur, t, size, avail):
         """(line1 tuple, seconds until it changes) for the line being sung.
@@ -776,23 +817,6 @@ class LyricWindow(QWidget):
             if t <= end + 0.8:
                 return None, end + 0.8 - t
         return None, 1e9
-
-    def _scene_at(self, t):
-        """What's playing at t from the audio analysis (detail mode only), or None."""
-        scenes = getattr(self, "scenes", None)
-        if self.cfg["gap_label"] != "detail" or not scenes:
-            return None
-        k = bisect.bisect_right([s[0] for s in scenes], t) - 1
-        if k >= 0 and t < scenes[k][1]:
-            return scenes[k][2]
-        return None
-
-    def _scene_wake(self, t):
-        scenes = getattr(self, "scenes", None)
-        if self.cfg["gap_label"] != "detail" or not scenes:
-            return 1e9
-        edges = [x for s in scenes for x in (s[0], s[1]) if x > t]
-        return min(edges) - t if edges else 1e9
 
     @staticmethod
     def _scroll(width, progress_px, avail):
@@ -899,7 +923,7 @@ class LyricWindow(QWidget):
     def paintEvent(self, e):
         if not self._frame:
             return
-        line1, line2, paused, show_panel, locked, _ = self._frame
+        line1, rows, toast, paused, show_panel, locked, _ = self._frame
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
@@ -910,8 +934,8 @@ class LyricWindow(QWidget):
         elif not locked:
             p.fillRect(self.rect(), QColor(0, 0, 0, 1))  # keep the window hoverable
 
-        (top1, h1), (top2, h2) = self._rows()
-        size1, size2 = self.cfg["font_size"], self._sub_size()
+        size1 = self.cfg["font_size"]
+        top1, h1 = TOOLBAR_H + 2, size1 * 1.5
         clip = QRectF(14, 0, w - 28, h)
         if paused:
             p.setOpacity(0.55)
@@ -957,18 +981,37 @@ class LyricWindow(QWidget):
                 if alpha > 0:
                     draw(ox + x0, ox + x1, alpha)
             p.restore()
-        if line2:
-            text, role = line2
-            shape = self._shape(text, size2, role)
-            x = self._x_for(shape, 0.0, w)
-            y = top2 + (h2 - shape.height) / 2 - shape.margin
-            p.save()
-            p.setClipRect(clip)
-            if role == "toast":
-                p.setOpacity(1.0)
-            p.drawImage(QPointF(x, y), shape.image)
-            p.restore()
+        y = top1 + h1
+        for text, role in rows:
+            row_h = self._row_height(role)
+            if text:
+                shape = self._shape(text, self._sub_size() if role == "sub" else self._next_size(), role)
+                p.save()
+                p.setClipRect(clip)
+                p.drawImage(QPointF(self._x_for(shape, 0.0, w), y + (row_h - shape.height) / 2 - shape.margin),
+                            shape.image)
+                p.restore()
+            y += row_h
+        if toast and not show_panel:
+            self._draw_toast(p, toast, w)
         p.end()
+
+    def _draw_toast(self, p, text, w):
+        """A small pill in the strip above the lyrics, so messages never cover a lyric row."""
+        p.save()
+        p.setOpacity(1.0)
+        font = QFont(FONT_FAMILY)
+        font.setPixelSize(13)
+        fm = QFontMetricsF(font)
+        tw = min(fm.horizontalAdvance(text), w - 60)
+        rect = QRectF((w - tw) / 2 - 12, (TOOLBAR_H - 24) / 2 + 2, tw + 24, 24)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(16, 16, 20, 175))
+        p.drawRoundedRect(rect, 12, 12)
+        p.setFont(font)
+        p.setPen(QColor(255, 255, 255, 235))
+        p.drawText(rect, Qt.AlignCenter, fm.elidedText(text, Qt.ElideRight, tw))
+        p.restore()
 
     @staticmethod
     def _x_for(shape, scroll, w):

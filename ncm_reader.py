@@ -172,6 +172,9 @@ class NcmReader:
         self._frozen = 0.0
         self._next_id_read = 0.0
         self._last_info = None
+        self.epoch = 0                  # bumps on every seek / resume (the timeline restarted)
+        self.last_jump = ""             # "seek" or "resume"
+        self._was_paused = False
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="ncm-reader", daemon=True)
         self._thread.start()
@@ -292,12 +295,14 @@ class NcmReader:
                 self.song_id = song
                 self._anchor, self._last_s = None, None
                 self._samples.clear()
+                self._was_paused = False
             self.duration = duration if 0 < duration < 36000 else 0.0
             if status == STATUS_PAUSED or s < 0:
                 self.state = "paused"
                 self._frozen = max(s, 0.0)
                 self._anchor, self._last_s = None, None
                 self._samples.clear()
+                self._was_paused = True
                 return
             self.state = "playing"
             if s == self._last_s:
@@ -308,6 +313,11 @@ class NcmReader:
                 self._last_s = self._frozen = s
                 return
             if self._anchor is None or abs(guess - self._anchor) > self.JUMP:
+                if self._anchor is not None:
+                    self.epoch, self.last_jump = self.epoch + 1, "seek"
+                elif self._was_paused:
+                    self.epoch, self.last_jump = self.epoch + 1, "resume"
+                self._was_paused = False
                 self._samples.clear()
             self._samples.append((t, guess))
             while self._samples and t - self._samples[0][0] > self.WINDOW:

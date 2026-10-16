@@ -19,7 +19,9 @@ DEFAULTS = {
     "autofill": True,          # look in other lyric libraries when NetEase has none
     "ai_transcribe": True,     # last resort: transcribe the cached audio with Whisper
     "calibrate": True,         # line word timing up with the audio (once per song, cached)
-    "gap_label": "detail",     # instrumental stretches: off | simple (前奏/间奏/尾奏) | detail (what's playing)
+    "audio_sync": True,        # after a seek, re-time the clock from what the speakers play
+    "seek_lead": 0.0,          # learnt: how far NetEase's progress usually runs ahead after a seek
+    "gap_label": "simple",     # label stretches nobody sings with 前奏/间奏/尾奏: off | simple
     "locked": False,
     "visible": True,
     "x": None,
@@ -40,6 +42,8 @@ class Config(dict):
         except (OSError, ValueError):
             pass
         self["song_offsets"] = dict(self.get("song_offsets") or {})
+        if self["gap_label"] not in ("off", "simple"):      # "detail" (instrument names) was removed
+            self["gap_label"] = "simple"
 
     def save(self):
         os.makedirs(DATA_DIR, exist_ok=True)

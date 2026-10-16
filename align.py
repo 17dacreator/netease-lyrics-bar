@@ -6,10 +6,7 @@ aligned in its own short window, cut at the real vocal onset near its timestamp;
 afterwards every word is snapped onto stretches where the vocals are actually
 sounding.
 
-    python align.py <song_id> <duration_seconds> <lines.json | -> <out.json> [--scenes [--chinese]]
-
-With --scenes the same separation also labels what's playing (scenes.py) for the
-间奏 display; "-" skips the alignment.
+    python align.py <song_id> <duration_seconds> <lines.json> <out.json>
 
 lines.json: [{"start": s, "text": "...", "units": ["...", ...], "first": s?}, ...]: units
 are the display words of the line (they join back into its text); "first" is the
@@ -63,14 +60,19 @@ def _flip_short(mask, value, max_len):
     return out
 
 
-def vocal_activity(vocals):
-    """Boolean per 10 ms frame: is the separated vocal track audibly singing?"""
+def vocal_activity(vocals, covered=None):
+    """Boolean per 10 ms frame: is the separated vocal track audibly singing?
+
+    `covered` (bool per frame) limits the loudness reference to the part of the song
+    separated so far, for progressive calibration.
+    """
     hop = int(SR * HOP)
     n = len(vocals) // hop
     rms = np.sqrt((vocals[: n * hop].reshape(n, hop).astype(np.float64) ** 2).mean(1))
-    if not (rms > 0).any():
+    ref = rms[(rms > 0) & (covered[:n] if covered is not None else True)]
+    if not len(ref):
         return np.zeros(n, bool)
-    active = rms > np.percentile(rms[rms > 0], 95) * 0.1
+    active = rms > np.percentile(ref, 95) * 0.1
     active = _flip_short(active, False, 8)     # bridge dips under 80 ms (consonants, vibrato)
     return _flip_short(active, True, 5)        # drop blips under 50 ms (bleed, breaths)
 
@@ -109,7 +111,7 @@ def _onset_near(active, t, before=0.4, after=0.6):
     return min(onsets, key=lambda f: abs(f * HOP - t)) * HOP if onsets else None
 
 
-def plan_windows(lines, active, total):
+def plan_windows(lines, active, total, only=None):
     """[(line index, lo, hi)]: one short window per sung line.
 
     Aligning several lines at once fails on songs: Whisper's alignment hands the
@@ -120,6 +122,8 @@ def plan_windows(lines, active, total):
     todo = [i for i, ln in enumerate(lines) if ln["text"].strip() and not CREDIT.match(ln["text"])]
     windows = []
     for n, i in enumerate(todo):
+        if only is not None and i not in only:
+            continue
         start = lines[i]["start"]
         onset = _onset_near(active, start)
         lines[i]["_onset"] = onset is not None
@@ -176,59 +180,70 @@ def align_chunk(model, tokenizer, vocals, lo, hi, texts, language):
     return full, spans, _char_times(full, words)
 
 
-def align_song(vocals, lines):
+def make_aligner(lines):
+    """(model, tokenizer, language) for aligning these lyrics."""
     from faster_whisper.tokenizer import Tokenizer
     model = tr.get_whisper()
     language = text_language("".join(ln["text"] for ln in lines))
-    tokenizer = Tokenizer(model.hf_tokenizer, True, task="transcribe", language=language)
+    return model, Tokenizer(model.hf_tokenizer, True, task="transcribe", language=language), language
+
+
+def align_line(aligner, vocals, active, lines, i, lo, hi):
+    """Word timing for line i inside [lo, hi], or None."""
+    model, tokenizer, language = aligner
+    if hi - lo < 0.3:
+        return None
+    full, spans, chars = align_chunk(model, tokenizer, vocals, lo, hi, [lines[i]["text"]], language)
+    body_at = spans[0]
+    text = lines[i]["text"]
+    lead = len(text) - len(text.lstrip())       # unit offsets count from the raw text
+    words, pos, probs = [], 0, []
+    for unit in lines[i]["units"]:
+        seg = []
+        for k, ch in enumerate(unit):
+            j = body_at + pos + k - lead
+            if not ch.isspace() and 0 <= j < len(chars) and chars[j]:
+                seg.append(chars[j])
+        pos += len(unit)
+        if seg:
+            s, e = snap(min(c[0] for c in seg), max(c[1] for c in seg), active)
+            probs.extend(c[2] for c in seg)
+        else:
+            s = e = None
+        words.append([s, e, unit])
+    # fill units the text match missed by spacing them between known neighbours
+    known = [k for k, w in enumerate(words) if w[0] is not None]
+    if not known:
+        return None
+    for k, w in enumerate(words):
+        if w[0] is None:
+            before = max((j for j in known if j < k), default=None)
+            after = min((j for j in known if j > k), default=None)
+            s0 = words[before][1] if before is not None else words[after][0]
+            s1 = words[after][0] if after is not None else words[before][1] + 0.2
+            gap = (k - (before if before is not None else k - 1)) / \
+                  ((after if after is not None else k + 1) - (before if before is not None else k - 1))
+            w[0] = s0 + (s1 - s0) * gap
+            w[1] = w[0] + 0.1
+    for k in range(1, len(words)):            # keep word starts in order
+        words[k][0] = max(words[k][0], words[k - 1][0] + 0.02)
+        words[k][1] = max(words[k][1], words[k][0] + 0.02)
+    src_first = lines[i].get("first")         # the source's own word timing, if it has any
+    src_silent = src_first is not None and not active[
+        max(0, int((src_first - 0.05) / HOP)): int((src_first + 0.15) / HOP)].any()
+    return {"start": round(words[0][0], 3), "end": round(words[-1][1], 3),
+            "prob": round(float(np.mean(probs)) if probs else 0.0, 3),
+            "onset": bool(lines[i].get("_onset")), "src_silent": bool(src_silent),
+            "words": [[round(s, 3), round(e, 3), u] for s, e, u in words]}
+
+
+def align_song(vocals, lines):
+    """Whole song at once (used by the one-shot script and the scoring tests)."""
+    aligner = make_aligner(lines)
     active = vocal_activity(vocals)
-    total = len(vocals) / SR
     out = [None] * len(lines)
-    for line_index, lo, hi in plan_windows(lines, active, total):
-        if hi - lo < 0.3:
-            continue
-        full, spans, chars = align_chunk(model, tokenizer, vocals, lo, hi, [lines[line_index]["text"]], language)
-        for i, body_at in zip([line_index], spans):
-            text = lines[i]["text"]
-            lead = len(text) - len(text.lstrip())       # unit offsets count from the raw text
-            words, pos, probs = [], 0, []
-            for unit in lines[i]["units"]:
-                seg = []
-                for k, ch in enumerate(unit):
-                    j = body_at + pos + k - lead
-                    if not ch.isspace() and 0 <= j < len(chars) and chars[j]:
-                        seg.append(chars[j])
-                pos += len(unit)
-                if seg:
-                    s, e = snap(min(c[0] for c in seg), max(c[1] for c in seg), active)
-                    probs.extend(c[2] for c in seg)
-                else:
-                    s = e = None
-                words.append([s, e, unit])
-            # fill units the text match missed by spacing them between known neighbours
-            known = [k for k, w in enumerate(words) if w[0] is not None]
-            if not known:
-                continue
-            for k, w in enumerate(words):
-                if w[0] is None:
-                    before = max((j for j in known if j < k), default=None)
-                    after = min((j for j in known if j > k), default=None)
-                    s0 = words[before][1] if before is not None else words[after][0]
-                    s1 = words[after][0] if after is not None else words[before][1] + 0.2
-                    gap = (k - (before if before is not None else k - 1)) / \
-                          ((after if after is not None else k + 1) - (before if before is not None else k - 1))
-                    w[0] = s0 + (s1 - s0) * gap
-                    w[1] = w[0] + 0.1
-            for k in range(1, len(words)):            # keep word starts in order
-                words[k][0] = max(words[k][0], words[k - 1][0] + 0.02)
-                words[k][1] = max(words[k][1], words[k][0] + 0.02)
-            src_first = lines[i].get("first")         # the source's own word timing, if it has any
-            src_silent = src_first is not None and not active[
-                max(0, int((src_first - 0.05) / HOP)): int((src_first + 0.15) / HOP)].any()
-            out[i] = {"start": round(words[0][0], 3), "end": round(words[-1][1], 3),
-                      "prob": round(float(np.mean(probs)) if probs else 0.0, 3),
-                      "onset": bool(lines[i].get("_onset")), "src_silent": bool(src_silent),
-                      "words": [[round(s, 3), round(e, 3), u] for s, e, u in words]}
+    for i, lo, hi in plan_windows(lines, active, len(vocals) / SR):
+        out[i] = align_line(aligner, vocals, active, lines, i, lo, hi)
     return out
 
 
@@ -253,10 +268,7 @@ def main():
             if lines:
                 tr.stage("align")
                 result["lines"] = align_song(tr.to_16k(stems["vocals"], sr), lines)
-            if "--scenes" in flags:
-                tr.stage("scenes")
-                import scenes
-                result["scenes"] = scenes.label_song(stems, sr, tr.MODELS_DIR, "--chinese" in flags)
+
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {e}"
     result["elapsed"] = round(time.time() - t0, 1)
