@@ -18,8 +18,8 @@ EXE = "NeteaseLyrics"
 EXCLUDE = ["torch", "torchaudio", "torchvision", "demucs", "faster_whisper", "ctranslate2", "julius",
            "transformers", "onnxruntime", "tokenizers", "huggingface_hub", "scipy", "sympy", "pandas",
            "matplotlib", "IPython", "tkinter", "lameenc", "einops", "dora", "openunmix", "numba", "cv2",
-           "worker", "align"]
-FORBIDDEN = ("/data/", "config.json", "cache/", ".log", "/models/", ".git/", ".align.json", ".ai.json")
+           "PIL", "worker", "align"]
+FORBIDDEN = ("/data/", "config.json", "cache/", ".log", "/models/", ".git/", ".align.json", ".ai.json", ".fill.json")
 
 
 def desktop():
