@@ -122,9 +122,7 @@ class Tray(QSystemTrayIcon):
         self.act_trans = self._action("显示翻译", lambda _: window.toggle_trans(), checkable=True)
         self.act_next = self._action("显示下一句", lambda _: window.toggle_next(), checkable=True)
         self.act_reveal = self._action("逐词出现", lambda _: window.toggle_reveal(), checkable=True)
-        self.act_fill = self._action("网易云没词时自动补歌词", lambda _: window.toggle_autofill(),
-                                     checkable=True)
-        self.act_ai = self._action("哪儿都没词时用 AI 听写", lambda _: window.toggle_ai(), checkable=True)
+        self.act_ai = self._action("「找词」对不上时用 AI 听写", lambda _: window.toggle_ai(), checkable=True)
         self.act_cal = self._action("按音频自动校准逐字时间", lambda _: window.toggle_calibrate(), checkable=True)
         self.act_sync = self._action("拖进度条后听声音自动对时", self._toggle_sync, checkable=True)
         if not window.worker.available:              # packaged build without the AI parts
@@ -167,7 +165,6 @@ class Tray(QSystemTrayIcon):
         self.act_trans.setChecked(cfg["show_trans"])
         self.act_next.setChecked(cfg["show_next"])
         self.act_reveal.setChecked(cfg["reveal"])
-        self.act_fill.setChecked(cfg["autofill"])
         self.act_ai.setChecked(cfg["ai_transcribe"])
         self.act_cal.setChecked(cfg["calibrate"])
         self.act_sync.setChecked(cfg["audio_sync"])

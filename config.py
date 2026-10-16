@@ -19,8 +19,7 @@ DEFAULTS = {
     "show_next": True,         # preview the upcoming line under the current one
     "reveal": True,            # words appear one by one
     "sweep": True,             # sung part fills from white to the theme colour, left to right
-    "autofill": True,          # look in other lyric libraries when NetEase has none
-    "ai_transcribe": True,     # last resort: transcribe the cached audio with Whisper
+    "ai_transcribe": True,     # 找词 found nothing that fits: use the Whisper transcription instead
     "calibrate": True,         # line word timing up with the audio (once per song, cached)
     "audio_sync": True,        # after a seek, re-time the clock from what the speakers play
     "seek_lead": 0.0,          # learnt: how far NetEase's progress usually runs ahead after a seek

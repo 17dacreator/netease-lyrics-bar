@@ -31,13 +31,9 @@ EDGE = 8
 FONT_MIN, FONT_MAX = 18, 72
 NOTES = {
     "failed": "歌词加载失败，稍后自动重试", "none": "暂无歌词", "pure": "纯音乐",
-    "search": "正在别的歌词库找歌词…",
-    "ai:audio": "AI 听写：等网易云把这首歌缓存好…", "ai:vocals": "AI 听写：分离人声…",
-    "ai:words": "AI 听写：识别歌词…", "ai_failed": "暂无歌词（AI 听写没成功）",
-    "pure:search": "网易云标的是纯音乐，先去别的歌词库找找…",
-    "pure:ai:audio": "纯音乐？等缓存好了听听有没有人唱…",
-    "pure:ai:vocals": "纯音乐？正在听有没有人唱…",
-    "pure:ai:words": "听到有人唱，AI 听写中…",
+    "find:search": "正在各个歌词库找这首的歌词…",
+    "find:listen": "找到了歌词，正在听这首歌核对…",
+    "find:listen0": "没找到能用的歌词，正在听这首歌…",
 }
 REVEAL_FADE = 0.09            # seconds a newly revealed word takes to fade in
 GAP_MIN = 4.0                 # seconds without singing before a stretch gets a 间奏 label
@@ -210,6 +206,8 @@ class LyricWindow(QWidget):
     changed = Signal()            # lock / visibility / theme / translation toggled
     hidden_by_user = Signal()
     _fetched = Signal(int, str, object, str, str)
+    _find_state = Signal(int, str)
+    _found = Signal(int, str, str, bool)
     _calib_event = Signal(int, object, object, str, bool)
 
     def __init__(self, cfg, reader, sync=None):
@@ -232,6 +230,10 @@ class LyricWindow(QWidget):
         self._calib_announced = False
         self._calib_event.connect(self._on_calib_event)
         self._fetched.connect(self._on_fetched)
+        self._finding = None           # song id 找词 is working on
+        self._before_find = ""
+        self._find_state.connect(self._on_find_state)
+        self._found.connect(self._on_found)
 
         self.hovered = False
         self._hover_left_at = 0.0
@@ -304,7 +306,7 @@ class LyricWindow(QWidget):
         button("+0.01", "歌词提前 0.01 秒", lambda: self.adjust_offset(0.01))
         button("+0.1", "歌词提前 0.1 秒", lambda: self.adjust_offset(0.1))
         self.scope_btn = button("", "点一下切换：调全部歌曲 / 只调这首", self.toggle_scope)
-        button("找词", "这首没有歌词时点这里：去别的歌词库找，找不到就用 AI 听写", self.find_lyrics_now)
+        self.find_btn = button("找词", "", self.find_lyrics_now)
         button("校准", "逐字对不上时点这里：按这首歌的声音重新对齐每个字", self.calibrate_now)
         self.lock_btn = button("锁定", "锁定后鼠标可以穿透歌词", lambda: self.set_locked(True))
         button("✕", "隐藏歌词（托盘图标里可以再打开）", self.hide_by_user)
@@ -319,6 +321,10 @@ class LyricWindow(QWidget):
         self.gap_btn.setChecked(self.cfg["gap_label"] != "off")
         self.reveal_btn.setChecked(bool(self.cfg["reveal"]))
         self.sweep_btn.setChecked(bool(self.cfg["sweep"]))
+        filled = bool(self.lyrics and self.lyrics.lines and self.lyrics.source != "网易云")
+        self.find_btn.setText("撤词" if filled else "找词")
+        self.find_btn.setToolTip("这首的歌词是「找词」补来的，对不上就点这里撤掉" if filled else
+                                 "这首没有歌词时点这里：去别的歌词库找，听过这首歌、对得上才填")
 
     # -- offsets -----------------------------------------------------------
 
@@ -389,14 +395,6 @@ class LyricWindow(QWidget):
         self._refresh_toolbar()
         self._save_timer.start()
         self.changed.emit()
-
-    def toggle_autofill(self):
-        self.cfg["autofill"] = not self.cfg["autofill"]
-        self._save_timer.start()
-        self.changed.emit()
-        if self.song_id:
-            _, _, duration, _ = self.reader.snapshot()
-            self._load_song(self.song_id, duration)
 
     def toggle_next(self):
         self.cfg["show_next"] = not self.cfg["show_next"]
@@ -608,24 +606,12 @@ class LyricWindow(QWidget):
         self.cfg["ai_transcribe"] = not self.cfg["ai_transcribe"]
         self._save_timer.start()
         self.changed.emit()
-        if self.cfg["ai_transcribe"] and self.song_id and self.fetch_state in ("none", "pure"):
-            _, _, duration, _ = self.reader.snapshot()
-            self._load_song(self.song_id, duration)
 
-    def find_lyrics_now(self):
-        """Look again from scratch: other libraries, then AI transcription (even if marked instrumental)."""
-        if not self.song_id.isdigit():
-            self.toast("现在没在放歌")
-            return
-        ly = self.lyrics
-        if ly and ly.lines and not ly.pure_music and ly.source != "AI听写":
-            self.toast("这首已经有歌词了")
-            return
-        lyr.forget_misses(self.song_id)
+    def _reload(self):
         _, _, duration, _ = self.reader.snapshot()
-        self._load_song(self.song_id, duration, force=True)
+        self._load_song(self.song_id, duration)
 
-    def _load_song(self, song_id, duration, force=False):
+    def _load_song(self, song_id, duration):
         self.stop_ai()               # the listener moved on; don't spend the GPU on the old song
         self.song_id, self.title, self.lyrics = song_id, "", None
         self._fetch_gen += 1
@@ -634,12 +620,13 @@ class LyricWindow(QWidget):
             self.fetch_state = ""
             return
         self.fetch_state = "loading"
-        if self.worker.available and song_id.isdigit() and (self.cfg["calibrate"] or self.cfg["ai_transcribe"]):
+        if self.worker.available and song_id.isdigit() and self.cfg["calibrate"]:
             self.worker.submit({"job": "warm"})        # load the models while the lyrics download
         gen = self._fetch_gen
-        threading.Thread(target=self._fetch_worker, args=(gen, song_id, duration, force), daemon=True).start()
+        threading.Thread(target=self._fetch_worker, args=(gen, song_id, duration), daemon=True).start()
 
-    def _fetch_worker(self, gen, song_id, duration, force=False):
+    def _fetch_worker(self, gen, song_id, duration):
+        """NetEase's lyrics, or what 找词 filled in earlier. Nothing is searched for here."""
         meta = lyr.song_meta(song_id)
         if duration and not meta["duration"]:
             meta["duration"] = duration
@@ -652,29 +639,10 @@ class LyricWindow(QWidget):
         except Exception:
             self._fetched.emit(gen, song_id, None, title, "failed")
             return
-        marked_pure = ly.pure_music
-        pre = "pure:" if marked_pure else ""
-        if lyr.needs_more(ly) and self.cfg["autofill"]:
-            self._fetched.emit(gen, song_id, None, title, pre + "search")
-            try:
-                ly = lyr.fallback_lyrics(song_id, meta) or ly
-            except Exception:
-                pass
+        if lyr.needs_more(ly):
+            ly = lyr.load_fill(song_id, meta["duration"]) or ly
         state = "ok"
-        if lyr.needs_more(ly) and self.cfg["ai_transcribe"] and self.worker.available and gen == self._fetch_gen:
-            known = lyr.ai_state(song_id)
-            if isinstance(known, lyr.Lyrics):
-                ly = known
-            elif known != "instrumental":
-                # A song marked instrumental is first checked for a voice; "找词" skips that check.
-                result = self._transcribe(gen, song_id, title, meta, marked_pure and not force, pre)
-                if gen != self._fetch_gen:
-                    return
-                if isinstance(result, lyr.Lyrics):
-                    ly = result
-                elif result is None:
-                    state = "ai_failed"
-        if state == "ok" and lyr.needs_more(ly):
+        if lyr.needs_more(ly):
             state = "pure" if ly.pure_music else "none"
         need_align = False
         if state == "ok" and self.cfg["calibrate"] and lyr.can_calibrate(ly):
@@ -687,30 +655,138 @@ class LyricWindow(QWidget):
         if need_align:
             self._start_calibration(gen, song_id, ly, quiet=True)
 
-    def _transcribe(self, gen, song_id, title, meta, check_vocals, pre):
-        """AI transcription on the worker (blocks the fetch thread): Lyrics, "instrumental", or None."""
+    # -- 找词: only when the listener asks -------------------------------------
+
+    def find_lyrics_now(self):
+        """Search the other libraries, check what turns up against the song itself, fill it in.
+        On a song that already has filled-in lyrics, take them away again."""
+        song_id = self.song_id
+        if not song_id.isdigit():
+            self.toast("现在没在放歌")
+            return
+        if self._finding == song_id:
+            self.toast("正在找，稍等…")
+            return
+        if self.fetch_state == "loading":
+            self.toast("歌词还在加载，稍等")
+            return
+        ly = self.lyrics
+        if ly and ly.lines and ly.source != "网易云":          # the button reads 撤词
+            lyr.forget_fill(song_id)
+            self.toast("已撤掉补来的歌词", 2.0)
+            self._reload()
+            return
+        if ly and ly.lines and not ly.pure_music:
+            self.toast("这首已经有歌词了")
+            return
+        self._finding = song_id
+        self._before_find = self.fetch_state
+        self._on_find_state(self._fetch_gen, "find:search")
+        threading.Thread(target=self._find_worker, args=(self._fetch_gen, song_id), daemon=True).start()
+
+    def _find_worker(self, gen, song_id):
+        message, filled = "", False
+        try:
+            _, _, duration, _ = self.reader.snapshot()
+            meta = lyr.song_meta(song_id)
+            if duration and not meta["duration"]:
+                meta["duration"] = duration
+            found = lyr.find_candidates(song_id, meta)
+            if gen != self._fetch_gen:
+                return
+            if self.worker.available:
+                message, filled = self._check_by_ear(gen, song_id, meta, found)
+            else:
+                message, filled = self._fill_unchecked(song_id, found)
+        except Exception as e:
+            lyr.log_error(song_id, f"find {type(e).__name__}: {e}")
+            message = "找词出错了，过会儿再试"
+        finally:
+            self._found.emit(gen, song_id, message, filled)
+
+    def _check_by_ear(self, gen, song_id, meta, found):
+        """Listen to the song (vocals separated, then transcribed) and keep found lyrics whose
+        lines are heard where they claim to be. Returns (message, filled)."""
+        if not found and not self.cfg["ai_transcribe"]:
+            lyr.log_find(song_id, "nothing found")
+            return "没找到能用的歌词", False
+        self._find_state.emit(gen, "find:listen" if found else "find:listen0")
+        result = self._transcribe(song_id, meta)
+        if gen != self._fetch_gen:
+            return "", False
+        if result is None:
+            return "没听成（这首可能还没缓存好），过会儿再点一次「找词」", False
+        if result.get("instrumental"):
+            lyr.log_find(song_id, f"{len(found)} found; instrumental, singing {result.get('singing')}s")
+            return "这首听下来没人唱，是纯音乐，没填歌词", False
+        words = [w for ln in result["lines"] for w in ln["words"]]
+        scored = []
+        for c in found:
+            score, shift, err, checked = lyr.listen_score(lyr.build(c["api"], meta["duration"]),
+                                                          words, result.get("voiced"))
+            scored.append((score, shift, err, checked, c))
+        lyr.log_find(song_id, f"singing {result.get('singing')}s, heard {len(result['lines'])} lines; " +
+                     ", ".join(f"{c['source']} {s:.2f} shift {sh:+.2f} err {e:.2f} of {n}"
+                               for s, sh, e, n, c in scored))
+        good = [x for x in scored if lyr.listen_ok(x[0], x[2], x[3])]
+        if good:
+            # Close scores: keep the library order (NetEase versions often have word timing and translations).
+            top = max(x[0] for x in good)
+            score, shift, err, checked, c = next(x for x in good if x[0] >= top - 0.05)
+            lyr.save_fill(song_id, {"source": c["source"], "api": c["api"], "shift": shift,
+                                    "checked": True, "score": round(score, 2)})
+            moved = f"，整体挪了 {abs(shift):.1f} 秒" if abs(shift) >= 0.25 else ""
+            return f"已从{c['source']}补上歌词（听过这首歌，对得上{moved}）", True
+        lead = "找到的歌词跟这首歌对不上，" if found else "没找到能用的歌词，"
+        if self.cfg["ai_transcribe"]:
+            lyr.save_fill(song_id, {k: result[k] for k in ("source", "model", "language", "lines")})
+            return lead + "已用 AI 听写（可能有听错的地方）", True
+        return lead + "没填", False
+
+    def _fill_unchecked(self, song_id, found):
+        """Without the AI parts nothing can be checked by ear: only a same-length match is used."""
+        strict = [c for c in found if c["strict"]]
+        lyr.log_find(song_id, f"{len(found)} found, {len(strict)} same length; unchecked")
+        if not strict:
+            return ("找到的歌词跟这首长度对不上，没填" if found else "没找到能用的歌词"), False
+        c = strict[0]
+        lyr.save_fill(song_id, {"source": c["source"], "api": c["api"], "shift": 0.0, "checked": False})
+        return f"已从{c['source']}补上歌词（没法听声音核对，对不上就点「撤词」）", True
+
+    def _transcribe(self, song_id, meta):
+        """Separate and transcribe the song on the worker (blocks): its result dict, or None."""
         done, box = threading.Event(), {}
 
         def on_event(msg):
-            if "stage" in msg:
-                if gen == self._fetch_gen:
-                    self._fetched.emit(gen, song_id, None, title, f"{pre}ai:{msg['stage']}")
-            else:
+            if "stage" not in msg:
                 box.update(msg)
                 done.set()
 
-        self._fetched.emit(gen, song_id, None, title, pre + "ai:audio")
         jid = self.worker.submit({"job": "transcribe", "song": song_id, "duration": meta["duration"],
-                                  "hint": lyr.language_hint(meta), "check_vocals": check_vocals}, on_event)
+                                  "hint": lyr.language_hint(meta), "check_vocals": True}, on_event)
         self._jobs.append(jid)
         done.wait(lyr.AI_TIMEOUT)
-        result = box.get("done")
-        if result is None:
-            if box.get("error") not in (None, "cancelled"):
-                lyr.log_error(song_id, "transcribe " + box["error"])
-            return None
-        lyr.save_ai(song_id, result)
-        return "instrumental" if result.get("instrumental") else lyr.ai_state(song_id)
+        if box.get("error") not in (None, "cancelled"):
+            lyr.log_error(song_id, "transcribe " + box["error"])
+        return box.get("done")
+
+    def _on_find_state(self, gen, state):
+        if gen == self._fetch_gen and self._finding == self.song_id:
+            self.fetch_state = state
+            self._force_paint = True
+
+    def _on_found(self, gen, song_id, message, filled):
+        if self._finding == song_id:
+            self._finding = None
+        if gen != self._fetch_gen or song_id != self.song_id:
+            return
+        if message:
+            self.toast(message, 3.5)
+        if filled:
+            self._reload()
+        elif self.fetch_state.startswith("find:"):
+            self.fetch_state = self._before_find
+            self._force_paint = True
 
     def _start_calibration(self, gen, song_id, ly, quiet):
         """Align `ly` to the audio on the worker, nearest the listener first; results arrive in batches."""
@@ -771,10 +847,7 @@ class LyricWindow(QWidget):
             return
         self.lyrics, self.title, self.fetch_state = ly, title, state
         self._force_paint = True
-        if state == "ok" and ly and ly.lines and ly.source == "AI听写":
-            self.toast("没找到现成的歌词，已用 AI 听写（可能有听错的地方）", 3.5)
-        elif state == "ok" and ly and ly.lines and ly.source != "网易云":
-            self.toast(f"网易云没有这首的歌词，已从{ly.source}补上", 3.0)
+        self._refresh_toolbar()
         if state == "failed":
             QTimer.singleShot(15000, lambda: self._retry(gen))
 

@@ -10,6 +10,7 @@ One JSON object per line on stdin / stdout:
   in : {"id": n, "job": "warm"}
        {"id": n, "job": "align", "song": sid, "duration": d, "lines": [...], "focus": seconds}
        {"id": n, "job": "transcribe", "song": sid, "duration": d, "hint": "ja", "check_vocals": bool}
+           (done: {"lines": [...], "singing": s, "voiced": [[start, end], ...]} or {"instrumental": true})
        {"cancel": n}
   out: {"ready": true}
        {"id": n, "stage": "..."}
@@ -152,14 +153,31 @@ def job_align(job, cancelled):
     send({"id": jid, "done": {"lines": results}})
 
 
-def singing_seconds(stems, sr):
-    """How long a clearly audible voice is the main thing in the mix."""
+def _voice_frames(stems, sr):
+    """Per 0.1 s: is a clearly audible voice the main thing in the mix?"""
     hop = int(sr * 0.1)
     n = len(stems["vocals"]) // hop
     energy = {k: (x[: n * hop].reshape(n, hop).astype(np.float64) ** 2).mean(1) for k, x in stems.items()}
     total = sum(energy.values()) + 1e-12
     audible = total > np.percentile(total, 95) * 0.01
-    return float(((energy["vocals"] / total >= 0.3) & audible).sum() * 0.1)
+    return (energy["vocals"] / total >= 0.3) & audible
+
+
+def singing_seconds(stems, sr):
+    """How long a clearly audible voice is the main thing in the mix."""
+    return float(_voice_frames(stems, sr).sum() * 0.1)
+
+
+def voice_spans(stems, sr, bridge=0.5):
+    """[[start, end], ...] seconds where someone sings, gaps under `bridge` s closed."""
+    spans = []
+    for k in np.flatnonzero(_voice_frames(stems, sr)):
+        t = k * 0.1
+        if spans and t - spans[-1][1] <= bridge:
+            spans[-1][1] = round(t + 0.1, 1)
+        else:
+            spans.append([round(t, 1), round(t + 0.1, 1)])
+    return spans
 
 
 def job_transcribe(job, cancelled):
@@ -173,20 +191,19 @@ def job_transcribe(job, cancelled):
     stems, sr = separate(audio, rate, 0.0, audio.shape[1] / rate)
     if cancelled(jid):
         return
-    if job.get("check_vocals"):
-        sing = singing_seconds(stems, sr)
-        if sing < MIN_SINGING:
-            send({"id": jid, "done": {"instrumental": True, "singing": round(sing, 1)}})
-            return
+    sing, voiced = singing_seconds(stems, sr), voice_spans(stems, sr)
+    if job.get("check_vocals") and sing < MIN_SINGING:
+        send({"id": jid, "done": {"instrumental": True, "singing": round(sing, 1)}})
+        return
     send({"id": jid, "stage": "words"})
     words, language = tr.transcribe(tr.to_16k(stems["vocals"], sr), job.get("hint", ""))
     lines = tr.to_lines(words)
     if job.get("check_vocals") and (len(lines) < MIN_LINES or sum(len(ln["words"]) for ln in lines) < MIN_WORDS):
         # Vocal samples in an instrumental, not lyrics (energy alone can't tell them apart).
-        send({"id": jid, "done": {"instrumental": True, "lines_heard": len(lines)}})
+        send({"id": jid, "done": {"instrumental": True, "singing": round(sing, 1), "lines_heard": len(lines)}})
         return
     send({"id": jid, "done": {"source": "AI听写", "model": tr.WHISPER_MODEL, "language": language,
-                              "lines": lines}})
+                              "lines": lines, "singing": round(sing, 1), "voiced": voiced}})
 
 
 JOBS = {"warm": job_warm, "align": job_align, "transcribe": job_transcribe}

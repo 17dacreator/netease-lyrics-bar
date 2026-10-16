@@ -1,8 +1,9 @@
 """Fetch, cache and parse lyrics.
 
-NetEase first (LRC line timing + YRC word timing). When NetEase has nothing,
-optionally fall back to other versions of the same song on NetEase, LRCLIB and
-QQ Music, matched by title, artist and duration. Lines without real word timing
+NetEase first (LRC line timing + YRC word timing). Only when the listener presses
+找词 are other versions of the song on NetEase, LRCLIB and QQ Music searched,
+matched by title, kind of take, artist and length, and checked against what the
+song actually sings before they are filled in. Lines without real word timing
 get estimated word timing so they can be revealed word by word.
 """
 import bisect
@@ -10,7 +11,9 @@ import html
 import json
 import os
 import re
+import threading
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 
 import requests
@@ -295,87 +298,141 @@ def display_title(meta):
     return f"{meta['title']} - {' / '.join(meta['artists'])}".strip(" -")
 
 
-# -- fallback sources ---------------------------------------------------------------
+# -- finding lyrics elsewhere (only when the listener presses 找词) ----------------------
 
-def _norm(s):
-    s = re.sub(r"[(（\[【].*?[)）\]】]", "", s or "")
-    return re.sub(r"[\W_]+", "", s).lower()
+FIND_DEADLINE = 20.0          # seconds all library lookups together may take
+PER_SOURCE = 3                # candidates kept from each library
+STRICT_SLACK = 1.5            # without a listen, only near-identical lengths are trusted
+# Words in a title's brackets / " - " suffix that mark a different take of a song.
+QUALIFIERS = [
+    ("inst", r"伴奏|纯音乐|(?<![a-z])inst(rumental)?(?![a-z])|off ?vocal|karaoke|卡拉ok"),
+    ("live", r"(?<![a-z])live(?![a-z])|现场|演唱会"),
+    ("remix", r"remix|(?<![a-z])(mix|dj|bootleg)(?![a-z])"),
+    ("acoustic", r"acoustic|unplugged|不插电"),
+    ("cover", r"cover|翻唱|翻自"),
+    ("demo", r"(?<![a-z])demo(?![a-z])"),
+    ("short", r"(?<![a-z])(tv|size|short|cut|edit)(?![a-z])"),
+    ("long", r"extended|加长"),
+    ("piano", r"piano|钢琴"),
+    ("orch", r"orchestra|交响|管弦"),
+    ("chorus", r"合唱|choir"),
+    ("ver", r"(?<![a-z])ver(sion)?(?![a-z])|版"),
+]
+NOT_A_VERSION = re.compile(r"album|original|single|remaster|原版|正式")
+FEAT = re.compile(r"\s(feat|ft)\.?\s.*$", re.I)
+CREDIT = re.compile(r"^.{0,12}[:：]")       # "作词 : ..." style lines are never sung
+PLACEHOLDER = re.compile(r"纯音乐|请欣赏|请您欣赏|instrumental|no lyrics", re.I)
+
+
+def _split_title(title):
+    """(normalised main title, lower-cased bracket / suffix text)."""
+    title = title or ""
+    extras = " ".join(re.findall(r"[(（\[【](.*?)[)）\]】]", title))
+    main = re.sub(r"[(（\[【].*?[)）\]】]", " ", title)
+    parts = re.split(r"\s+[-–—~～]\s+", main, maxsplit=1)
+    if len(parts) == 2:
+        main, extras = parts[0], extras + " " + parts[1]
+    main = re.sub(r"[\W_]+", "", FEAT.sub("", main)).lower()
+    return main or re.sub(r"[\W_]+", "", title).lower(), extras.lower()
+
+
+def _qualifiers(extras):
+    found = {name for name, pattern in QUALIFIERS if re.search(pattern, extras)}
+    if "ver" in found and NOT_A_VERSION.search(extras):
+        found.discard("ver")
+    return found
+
+
+def _artists(names):
+    return {re.sub(r"[\W_]+", "", a).lower() for a in names} - {""}
 
 
 def _same_song(meta, title, artists, duration):
-    want, got = _norm(meta["title"]), _norm(title)
-    if not want or not got or (want != got and not (want in got or got in want)):
+    """Same title (and the same kind of take: live, remix, instrumental...), a shared artist,
+    and a length within DURATION_SLACK."""
+    want, want_extra = _split_title(meta["title"])
+    got, got_extra = _split_title(title)
+    if not want or want != got or _qualifiers(want_extra) != _qualifiers(got_extra):
         return False
-    mine = {_norm(a) for a in meta["artists"] if _norm(a)}
-    theirs = {_norm(a) for a in artists if _norm(a)}
+    mine, theirs = _artists(meta["artists"]), _artists(artists)
     if mine and theirs and not (mine & theirs or any(a in b or b in a for a in mine for b in theirs)):
         return False
-    if meta["duration"] and duration and abs(meta["duration"] - duration) > DURATION_SLACK:
+    if not duration or (meta["duration"] and abs(meta["duration"] - duration) > DURATION_SLACK):
         return False
     return True
 
 
-def _from_netease_versions(meta, song_id):
+def _left(end, cap=8.0):
+    """Request timeout that respects the overall deadline."""
+    return max(1.0, min(cap, end - time.time()))
+
+
+def _netease_versions(meta, song_id, end):
     params = {"s": f"{meta['title']} {' '.join(meta['artists'][:2])}", "type": 1, "limit": 20}
-    songs = requests.get(SEARCH_API, params=params, headers=HEADERS, timeout=8).json() \
+    songs = requests.get(SEARCH_API, params=params, headers=HEADERS, timeout=_left(end)).json() \
         .get("result", {}).get("songs") or []
+    out = []
     for s in songs:
-        if str(s["id"]) == song_id:
-            continue
-        if not _same_song(meta, s.get("name"), [a.get("name", "") for a in s.get("artists") or []],
-                          (s.get("duration") or 0) / 1000.0):
+        if len(out) >= PER_SOURCE or time.time() > end:
+            break
+        duration = (s.get("duration") or 0) / 1000.0
+        if str(s["id"]) == song_id or not _same_song(
+                meta, s.get("name"), [a.get("name", "") for a in s.get("artists") or []], duration):
             continue
         api = netease_api(str(s["id"]))
-        if _has_lines(api) and not api.get("pureMusic"):
-            return api
-    return None
+        if not api.get("pureMusic"):
+            out.append((api, duration))
+    return out
 
 
-def _from_lrclib(meta):
+def _lrclib(meta, song_id, end):
+    found = []
     params = {"track_name": meta["title"], "artist_name": ", ".join(meta["artists"])}
     if meta["album"]:
         params["album_name"] = meta["album"]
     if meta["duration"]:
         params["duration"] = round(meta["duration"])
-    candidates = []
-    r = requests.get(LRCLIB_GET, params=params, headers=LRCLIB_HEADERS, timeout=8)
+    r = requests.get(LRCLIB_GET, params=params, headers=LRCLIB_HEADERS, timeout=_left(end))
     if r.status_code == 200:
-        candidates.append(r.json())
-    else:
+        found.append(r.json())
+    if time.time() < end:
         r = requests.get(LRCLIB_SEARCH, params={"track_name": meta["title"],
                                                 "artist_name": " ".join(meta["artists"][:2])},
-                         headers=LRCLIB_HEADERS, timeout=8)
+                         headers=LRCLIB_HEADERS, timeout=_left(end))
         if r.status_code == 200:
-            candidates.extend(r.json() or [])
-    for c in candidates:
-        if c.get("instrumental"):
-            return {"pureMusic": True}
-        if c.get("syncedLyrics") and _same_song(meta, c.get("trackName"), [c.get("artistName", "")],
-                                                c.get("duration") or 0):
-            return {"lrc": {"lyric": c["syncedLyrics"]}}
-    return None
+            found.extend(r.json() or [])
+    out, seen = [], set()
+    for c in found:
+        if len(out) >= PER_SOURCE:
+            break
+        if c.get("id") in seen or c.get("instrumental") or not c.get("syncedLyrics"):
+            continue
+        seen.add(c.get("id"))
+        if _same_song(meta, c.get("trackName"), [c.get("artistName", "")], c.get("duration") or 0):
+            out.append(({"lrc": {"lyric": c["syncedLyrics"]}}, c.get("duration") or 0))
+    return out
 
 
-def _from_qq(meta):
+def _qq(meta, song_id, end):
     params = {"w": f"{meta['title']} {' '.join(meta['artists'][:2])}", "format": "json", "n": 10, "p": 1, "cr": 1}
-    songs = requests.get(QQ_SEARCH, params=params, headers=QQ_HEADERS, timeout=8).json() \
+    songs = requests.get(QQ_SEARCH, params=params, headers=QQ_HEADERS, timeout=_left(end)).json() \
         .get("data", {}).get("song", {}).get("list") or []
+    out = []
     for s in songs:
-        if not _same_song(meta, s.get("songname"), [a.get("name", "") for a in s.get("singer") or []],
-                          s.get("interval") or 0):
+        if len(out) >= PER_SOURCE or time.time() > end:
+            break
+        duration = s.get("interval") or 0
+        if not _same_song(meta, s.get("songname"), [a.get("name", "") for a in s.get("singer") or []], duration):
             continue
         j = requests.get(QQ_LYRIC, params={"songmid": s["songmid"], "format": "json", "nobase64": 1, "g_tk": 5381},
-                         headers=QQ_HEADERS, timeout=8).json()
+                         headers=QQ_HEADERS, timeout=_left(end)).json()
         lrc = html.unescape(j.get("lyric") or "")
         if parse_lrc(lrc):
-            return {"lrc": {"lyric": lrc}, "tlyric": {"lyric": html.unescape(j.get("trans") or "")}}
-    return None
+            out.append(({"lrc": {"lyric": lrc}, "tlyric": {"lyric": html.unescape(j.get("trans") or "")}}, duration))
+    return out
 
 
-FALLBACKS = [("网易云其他版本", _from_netease_versions), ("LRCLIB", _from_lrclib), ("QQ音乐", _from_qq)]
-
-
-PLACEHOLDER = re.compile(r"纯音乐|请欣赏|请您欣赏|instrumental|no lyrics", re.I)
+SOURCES = [("网易云其他版本", _netease_versions), ("LRCLIB", _lrclib), ("QQ音乐", _qq)]
 
 
 def _real_lyrics(api):
@@ -387,38 +444,213 @@ def _real_lyrics(api):
     return not (len(texts) <= 5 and any(PLACEHOLDER.search(t) for t in texts))
 
 
-def find_elsewhere(song_id, meta):
-    """(api_like_dict, source_name) from the first fallback that has synced lyrics, else (None, None)."""
-    path = os.path.join(CACHE_DIR, f"{song_id}.alt.json")
-    cached = _read_cache(path, lambda d: bool(d.get("source")))
-    if cached is not None:
-        return cached.get("api"), cached.get("source")
-    if not meta["title"]:
-        return None, None
-    errors = 0
-    for name, fn in FALLBACKS:
-        try:
-            api = fn(meta, song_id) if fn is _from_netease_versions else fn(meta)
-        except Exception:
-            errors += 1
+def plausible_timing(ly):
+    """False when lines come faster than anyone sings: sloppy uploads cram several lines into a
+    second or two (10+ sung units a second on a fifth of the lines; no normal lyric in the cache
+    comes close)."""
+    sung = [ln for ln in ly.lines if ln.text.strip() and not CREDIT.match(ln.text)]
+    rushed = total = 0
+    for a, b in zip(sung, sung[1:]):
+        units = len(_atoms(a.text))
+        if b.start - a.start < 0.05 or units < 3:      # stacked lines (a translation) / short calls
             continue
-        if api:
-            if api.get("pureMusic"):
-                break
-            if not _real_lyrics(api):
-                continue
-            _write_cache(path, {"source": name, "api": api})
-            return api, name
-    if errors < len(FALLBACKS):          # only remember a miss if the lookups actually ran
-        _write_cache(path, {"source": None})
-    return None, None
+        total += 1
+        rushed += b.start - a.start < units * 0.1
+    return rushed < 0.2 * max(total, 1)
 
 
-# -- AI transcription (last resort) --------------------------------------------------
+def _text_key(api):
+    return re.sub(r"[\W_]+", "", "".join(ln.text for ln in build(api).lines)).lower()[:300]
 
-def _ai_path(song_id):
-    return os.path.join(CACHE_DIR, f"{song_id}.ai.json")
 
+def find_candidates(song_id, meta, deadline=FIND_DEADLINE):
+    """Lyrics for this song from other libraries, best source first, all within `deadline` seconds:
+    [{"source", "api", "strict"}], where strict means the length matches within STRICT_SLACK."""
+    if not meta["title"]:
+        return []
+    end = time.time() + deadline
+    results, lock = {}, threading.Lock()
+
+    def run(name, fn):
+        try:
+            got = fn(meta, song_id, end)
+        except Exception:
+            got = []
+        with lock:
+            results[name] = got
+
+    threads = [threading.Thread(target=run, args=src, daemon=True) for src in SOURCES]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(max(0.0, end - time.time()))
+    out, seen = [], set()
+    with lock:
+        for name, _ in SOURCES:
+            for api, duration in results.get(name) or []:
+                if not _real_lyrics(api) or not plausible_timing(build(api)):
+                    continue
+                key = _text_key(api)
+                if key in seen:
+                    continue
+                seen.add(key)
+                strict = bool(meta["duration"] and abs(meta["duration"] - duration) <= STRICT_SLACK)
+                out.append({"source": name, "api": api, "strict": strict})
+    return out
+
+
+# -- checking found lyrics against what the song actually sings ------------------------
+
+LISTEN_TOL = 1.0      # seconds a heard word may sit outside its line's span
+MAX_SPAN = 8.0        # longest stretch one line is taken to be sung over
+MAX_SHIFT = 12.0      # another cut of the song may start this much earlier or later
+LINE_HIT = 0.5        # share of a line's words that must be heard for the line to count
+ACCEPT = 0.5          # share of lines that must be heard in place
+MAX_ONSET_ERR = 1.0   # seconds a heard line may start, on average, away from its time stamp
+MIN_CHECKED = 4       # lines needed before a score means anything
+
+
+def _atoms(text):
+    return ATOM.findall((text or "").lower())
+
+
+def _heard(words):
+    """Sorted (times, tokens) of transcribed words, one entry per atom."""
+    pairs = []
+    for s, e, text in words:
+        atoms = _atoms(text)
+        for k, a in enumerate(atoms):
+            pairs.append((s + (e - s) * k / len(atoms), a))
+    pairs.sort()
+    return [p[0] for p in pairs], [p[1] for p in pairs]
+
+
+def _voice_grid(voiced):
+    """Quarter-second flags from [[start, end], ...] singing spans."""
+    if not voiced:
+        return None
+    grid = bytearray(int(voiced[-1][1] * 4) + 2)
+    for s, e in voiced:
+        grid[int(s * 4): int(e * 4) + 1] = b"" * (int(e * 4) + 1 - int(s * 4))
+    return grid
+
+
+def listen_score(ly, words, voiced=None):
+    """How well `ly` fits what was heard (`words` = [[start, end, text], ...] from transcription,
+    `voiced` = [[start, end], ...] where someone sings).
+
+    A line counts when half its words are heard within its own span (plus LISTEN_TOL). A line
+    with nothing heard is skipped if someone sings there (transcription misses whole stretches)
+    and fails if nobody does. The whole lyric may sit up to MAX_SHIFT off. Returns (share of
+    checked lines heard in place, best shift, mean distance between a heard line's first word
+    and its time stamp, lines checked).
+    """
+    times, tokens = _heard(words)
+    grid = _voice_grid(voiced)
+    sung = [ln for ln in ly.lines if ln.text.strip() and not CREDIT.match(ln.text)]
+    spans = []
+    for k, ln in enumerate(sung):
+        atoms = Counter(_atoms(ln.text))
+        if sum(atoms.values()) < 2:
+            continue
+        nxt = sung[k + 1].start if k + 1 < len(sung) else ln.start + 6.0
+        spans.append((ln.start, ln.start + min(max(nxt - ln.start, 0.3), MAX_SPAN), atoms))
+    if len(spans) < MIN_CHECKED or not times:
+        return 0.0, 0.0, 99.0, 0
+
+    def sung_there(lo, hi):
+        if grid is None:
+            return False
+        part = grid[max(0, int(lo * 4)): max(0, int(hi * 4))]
+        return bool(part) and sum(part) >= 0.5 * len(part)
+
+    def score(shift):
+        hits, checked, err = 0, 0, 0.0
+        for lo, hi, atoms in spans:
+            a = bisect.bisect_left(times, lo + shift - LISTEN_TOL)
+            b = bisect.bisect_right(times, hi + shift + LISTEN_TOL)
+            if a == b and sung_there(lo + shift, hi + shift):
+                continue                                  # sung, but the transcription missed it
+            checked += 1
+            got = Counter(tokens[a:b])
+            if sum(min(n, got[t]) for t, n in atoms.items()) >= LINE_HIT * sum(atoms.values()):
+                hits += 1
+                first = next(times[i] for i in range(a, b) if tokens[i] in atoms)
+                err += abs(first - (lo + shift))
+        enough = checked >= max(MIN_CHECKED, 0.4 * len(spans))
+        return (hits / checked if enough else 0.0), shift, (err / hits if hits else 99.0), checked
+
+    steps = int(MAX_SHIFT * 4)
+    tried = [score(k / 4) for k in range(-steps, steps + 1)]
+    base, top = tried[steps], max(r[0] for r in tried)
+    # Repeated choruses make several shifts fit about as well; the right one is the tightest.
+    best = min((r for r in tried if r[0] >= 0.85 * top), key=lambda r: r[2])
+    if best[0] - base[0] < 0.1 and not (base[2] - best[2] >= 0.4 and best[0] >= base[0] - 0.05):
+        best = base                                       # only move lyrics that clearly sit off
+    return best
+
+
+def listen_ok(score, err, checked):
+    return checked >= MIN_CHECKED and score >= ACCEPT and err <= MAX_ONSET_ERR
+
+
+def shifted(ly, shift):
+    """`ly` moved `shift` seconds later (earlier if negative)."""
+    if not shift:
+        return ly
+    lines = [Line(max(0.0, ln.start + shift), ln.end + shift, ln.text,
+                  [Word(w.start + shift, w.end + shift, w.text) for w in ln.words] if ln.words else None,
+                  ln.trans, ln.estimated) for ln in ly.lines]
+    return Lyrics(lines, pure_music=ly.pure_music, word_level=ly.word_level, source=ly.source)
+
+
+# -- lyrics filled in by 找词 ------------------------------------------------------------
+
+def _fill_path(song_id):
+    return os.path.join(CACHE_DIR, f"{song_id}.fill.json")
+
+
+def save_fill(song_id, data):
+    """{"source", "api", "shift", ...} from a library, or {"source": "AI听写", "lines": [...]}."""
+    _write_cache(_fill_path(song_id), data)
+
+
+def has_fill(song_id):
+    return os.path.exists(_fill_path(song_id))
+
+
+def forget_fill(song_id):
+    if has_fill(song_id):
+        os.remove(_fill_path(song_id))
+
+
+def load_fill(song_id, duration=0.0):
+    """Lyrics filled in earlier with 找词, or None."""
+    try:
+        with open(_fill_path(song_id), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if data.get("lines"):
+        lines = [Line(d["start"], d["end"], "".join(w[2] for w in d["words"]),
+                      [Word(s, e, t) for s, e, t in d["words"]]) for d in data["lines"]]
+        return Lyrics(lines, word_level=True, source="AI听写")
+    if data.get("api"):
+        ly = build(data["api"], duration, data.get("source") or "别的歌词库")
+        ly.pure_music = False
+        return shifted(ly, data.get("shift") or 0.0)
+    return None
+
+
+def log_find(song_id, text):
+    try:
+        with open(os.path.join(DATA_DIR, "find.log"), "a", encoding="utf-8") as log:
+            log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {song_id} {text}\n")
+    except OSError:
+        pass
+
+
+# -- AI helpers ------------------------------------------------------------------------
 
 def log_error(song_id, text):
     try:
@@ -426,33 +658,6 @@ def log_error(song_id, text):
             log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {song_id} {text}\n")
     except OSError:
         pass
-
-
-def ai_state(song_id):
-    """Earlier AI result: Lyrics, "instrumental" (voice check found no singing), or None."""
-    try:
-        with open(_ai_path(song_id), encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        return None
-    if data.get("instrumental"):
-        return "instrumental"
-    if data.get("error") or not data.get("lines"):
-        return None
-    lines = [Line(d["start"], d["end"], "".join(w[2] for w in d["words"]),
-                  [Word(s, e, t) for s, e, t in d["words"]]) for d in data["lines"]]
-    return Lyrics(lines, word_level=True, source="AI听写")
-
-
-def save_ai(song_id, result):
-    _write_cache(_ai_path(song_id), result)
-
-
-def forget_misses(song_id):
-    """Drop remembered "no lyrics anywhere" / "instrumental" results so the next look starts fresh."""
-    for path in (os.path.join(CACHE_DIR, f"{song_id}.alt.json"), _ai_path(song_id)):
-        if os.path.exists(path):
-            os.remove(path)
 
 
 def language_hint(meta):
@@ -549,20 +754,6 @@ def netease_lyrics(song_id, meta):
 
 
 def needs_more(ly):
-    """No usable lyrics yet. Songs NetEase marks as instrumental count too: obscure songs
-    get that mark just because nobody uploaded lyrics."""
+    """No usable lyrics yet (songs NetEase marks as instrumental included: obscure songs
+    get that mark just because nobody uploaded lyrics, so 找词 may still find some)."""
     return not ly or not ly.lines or ly.pure_music
-
-
-def fallback_lyrics(song_id, meta):
-    """Lyrics from another library, or None."""
-    alt, source = find_elsewhere(song_id, meta)
-    return build(alt, meta["duration"], source) if alt else None
-
-
-def fetch_lyrics(song_id, meta, autofill=True):
-    """NetEase, then the other libraries when NetEase has nothing usable."""
-    ly = netease_lyrics(song_id, meta)
-    if needs_more(ly) and autofill:
-        ly = fallback_lyrics(song_id, meta) or ly
-    return ly
