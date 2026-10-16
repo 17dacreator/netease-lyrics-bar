@@ -898,10 +898,19 @@ class LyricWindow(QWidget):
                 p.save()
                 p.setClipRect(QRectF(left, 0, max(right - left, 0), h), Qt.IntersectClip)
                 p.setOpacity(p.opacity() * alpha)
-                p.drawImage(QPointF(x, y), base.image)
                 if lit and progress:
-                    p.setClipRect(QRectF(x, 0, ox + progress - x, h), Qt.IntersectClip)
+                    # Split at the sweep point rather than stacking the colour over the white:
+                    # each side is one complete layer, so the outline never doubles up and a
+                    # finished sweep looks exactly like a line drawn without one.
+                    cut = ox + progress
+                    p.save()
+                    p.setClipRect(QRectF(cut, 0, 1e6, h), Qt.IntersectClip)
+                    p.drawImage(QPointF(x, y), base.image)
+                    p.restore()
+                    p.setClipRect(QRectF(x - 1, 0, cut - x + 1, h), Qt.IntersectClip)
                     p.drawImage(QPointF(x, y), lit.image)
+                else:
+                    p.drawImage(QPointF(x, y), base.image)
                 p.restore()
 
             p.save()
