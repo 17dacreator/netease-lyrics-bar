@@ -97,6 +97,7 @@ class LyricWindow(QWidget):
     hidden_by_user = Signal()
     _fetched = Signal(int, str, object, str, str)
     _calib_status = Signal(str)
+    _scenes_ready = Signal(int, object)
 
     def __init__(self, cfg, reader):
         super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
@@ -114,6 +115,8 @@ class LyricWindow(QWidget):
         self._fetch_gen = 0
         self._ai_procs = []
         self._calib_status.connect(self._on_calib_status)
+        self.scenes = None            # [[start, end, label]] for the 间奏 display
+        self._scenes_ready.connect(self._on_scenes)
         self._fetched.connect(self._on_fetched)
 
         self.hovered = False
@@ -259,6 +262,17 @@ class LyricWindow(QWidget):
         self._save_timer.start()
         self.changed.emit()
         self._force_paint = True
+        if mode == "detail" and self.song_id.isdigit() and self.scenes is None and not self._ai_procs:
+            gen, song_id, title, ly = self._fetch_gen, self.song_id, self.title, self.lyrics
+
+            def work():                 # switched on mid-song: label this one in the background
+                cached = lyr.load_scenes(song_id)
+                if cached is not None:
+                    self._scenes_ready.emit(gen, cached)
+                    return
+                meta = lyr.song_meta(song_id)
+                self._analyse(gen, song_id, None, title, meta, True, quiet=True, context=ly)
+            threading.Thread(target=work, daemon=True).start()
 
     def toggle_sweep(self):
         self.cfg["sweep"] = not self.cfg["sweep"]
@@ -455,6 +469,7 @@ class LyricWindow(QWidget):
     def _load_song(self, song_id, duration):
         self.stop_ai()               # the listener moved on; don't burn the GPU on the old song
         self.song_id, self.title, self.lyrics = song_id, "", None
+        self.scenes = None
         self._fetch_gen += 1
         self._refresh_toolbar()
         if not song_id:
@@ -489,27 +504,45 @@ class LyricWindow(QWidget):
                     state = "ai_failed"
             if ai and ai.lines:
                 ly, state = ai, "ok"
+        want_scenes = self.cfg["gap_label"] == "detail" and song_id.isdigit()
+        if want_scenes:
+            cached_scenes = lyr.load_scenes(song_id)
+            if cached_scenes is not None:
+                self._scenes_ready.emit(gen, cached_scenes)
+                want_scenes = False
+        need_align = False
         if state == "ok" and self.cfg["calibrate"] and lyr.can_calibrate(ly):
             cached = lyr.load_alignment(song_id, ly)
             if cached:
                 ly = lyr.apply_alignment(ly, cached)
             else:
-                self._fetched.emit(gen, song_id, ly, title, state)     # show them now, refine later
-                self._calibrate(gen, song_id, ly, title, meta, quiet=True)
-                return
-        self._fetched.emit(gen, song_id, ly, title, state)
+                need_align = True
+        self._fetched.emit(gen, song_id, ly, title, state)      # show them now, refine below
+        if need_align or want_scenes:
+            self._analyse(gen, song_id, ly if need_align else None, title, meta, want_scenes,
+                          quiet=True, context=ly)
 
-    def _calibrate(self, gen, song_id, ly, title, meta, quiet):
+    def _analyse(self, gen, song_id, ly, title, meta, want_scenes, quiet, context=None):
+        """Background calibration of `ly` and/or 间奏 labels, from one pass over the audio."""
         def on_stage(stage):
             if not quiet and gen == self._fetch_gen:
                 self._calib_status.emit(stage)
-        data = lyr.run_alignment(song_id, meta, ly, on_stage, self._ai_procs)
+        data, scenes = lyr.run_analysis(song_id, meta, ly, want_scenes, on_stage, self._ai_procs,
+                                        lyrics_for_context=context)
         if gen != self._fetch_gen:
             return
-        if data:
-            self._fetched.emit(gen, song_id, lyr.apply_alignment(ly, data), title, "calibrated")
-        elif not quiet:
-            self._calib_status.emit("failed")
+        if scenes is not None:
+            self._scenes_ready.emit(gen, scenes)
+        if ly is not None:
+            if data:
+                self._fetched.emit(gen, song_id, lyr.apply_alignment(ly, data), title, "calibrated")
+            elif not quiet:
+                self._calib_status.emit("failed")
+
+    def _on_scenes(self, gen, scenes):
+        if gen == self._fetch_gen:
+            self.scenes = scenes
+            self._force_paint = True
 
     def calibrate_now(self):
         ly = getattr(self.lyrics, "raw", self.lyrics)
@@ -525,7 +558,7 @@ class LyricWindow(QWidget):
             meta = lyr.song_meta(song_id)
             if duration and not meta["duration"]:
                 meta["duration"] = duration
-            self._calibrate(gen, song_id, ly, title, meta, quiet=False)
+            self._analyse(gen, song_id, ly, title, meta, False, quiet=False)
         threading.Thread(target=work, daemon=True).start()
 
     def _on_calib_status(self, stage):

@@ -479,7 +479,8 @@ def _signature(ly):
 
 
 def can_calibrate(ly):
-    return bool(ly and ly.lines and ly.source != "AI听写" and any(ln.words for ln in ly.lines))
+    return bool(ly and ly.lines and not ly.pure_music and ly.source != "AI听写"
+                and any(ln.words for ln in ly.lines))
 
 
 def load_alignment(song_id, ly):
@@ -494,23 +495,58 @@ def load_alignment(song_id, ly):
     return data
 
 
-def run_alignment(song_id, meta, ly, on_stage, holder):
-    """Run align.py for these lyrics (blocking); returns the alignment data or None."""
+SCENES_VERSION = 1
+
+
+def _scenes_path(song_id):
+    return os.path.join(CACHE_DIR, f"{song_id}.scenes.json")
+
+
+def load_scenes(song_id):
+    """Cached [[start, end, label], ...] for the 间奏 display, or None."""
+    try:
+        with open(_scenes_path(song_id), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data.get("scenes") if data.get("version") == SCENES_VERSION else None
+
+
+def chinese_context(meta, ly=None):
+    """Chinese characters (and no kana) in title/artist/album/lyrics: allow Chinese instrument labels."""
+    text = " ".join([meta["title"], " ".join(meta["artists"]), meta.get("album", "")] +
+                    ([ln.text for ln in ly.lines[:40]] if ly else []))
+    return bool(KANJI.search(text)) and not KANA.search(text)
+
+
+def run_analysis(song_id, meta, ly, want_scenes, on_stage, holder, lyrics_for_context=None):
+    """One background pass over the cached audio (blocking).
+
+    Calibrates `ly` when given and/or labels the instrumental stretches when
+    want_scenes. Returns (alignment data or None, scenes or None); both are cached.
+    """
     os.makedirs(CACHE_DIR, exist_ok=True)
-    lines = []
-    for ln in ly.lines:
-        units = [w.text for w in ln.words] if ln.words else tokenize(ln.text)
-        item = {"start": ln.start, "text": ln.text, "units": units}
-        if ln.words and not ln.estimated:
-            item["first"] = ln.words[0].start
-        lines.append(item)
-    req = _align_path(song_id) + ".in.json"
-    with open(req, "w", encoding="utf-8") as f:
-        json.dump(lines, f, ensure_ascii=False)
+    req = "-"
+    if ly is not None:
+        lines = []
+        for ln in ly.lines:
+            units = [w.text for w in ln.words] if ln.words else tokenize(ln.text)
+            item = {"start": ln.start, "text": ln.text, "units": units}
+            if ln.words and not ln.estimated:
+                item["first"] = ln.words[0].start
+            lines.append(item)
+        req = _align_path(song_id) + ".in.json"
+        with open(req, "w", encoding="utf-8") as f:
+            json.dump(lines, f, ensure_ascii=False)
     out = _align_path(song_id) + ".out.json"
+    flags = []
+    if want_scenes:
+        flags.append("--scenes")
+        if chinese_context(meta, ly or lyrics_for_context):
+            flags.append("--chinese")
     exe = os.path.join(os.path.dirname(sys.executable), "python.exe")
     proc = subprocess.Popen([exe if os.path.exists(exe) else sys.executable, ALIGN_SCRIPT,
-                             song_id, str(meta["duration"] or 0), req, out],
+                             song_id, str(meta["duration"] or 0), req, out] + flags,
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
                             encoding="utf-8", creationflags=subprocess.CREATE_NO_WINDOW)
     holder.append(proc)
@@ -529,18 +565,24 @@ def run_alignment(song_id, meta, ly, on_stage, holder):
         with open(out, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
-        return None
+        return None, None
     finally:
         for p in (req, out):
-            if os.path.exists(p):
+            if p != "-" and os.path.exists(p):
                 os.remove(p)
-    if data.get("error") or not data.get("lines"):
+    if data.get("error"):
         with open(os.path.join(DATA_DIR, "ai_errors.log"), "a", encoding="utf-8") as log:
-            log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} align {song_id} {data.get('error', 'no lines')}\n")
-        return None
-    data["sig"] = _signature(ly)
-    _write_cache(_align_path(song_id), data)
-    return data
+            log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} analyse {song_id} {data['error']}\n")
+        return None, None
+    align = None
+    if ly is not None and data.get("lines"):
+        align = {"lines": data["lines"], "sig": _signature(ly), "elapsed": data.get("elapsed")}
+        _write_cache(_align_path(song_id), align)
+    scenes = None
+    if want_scenes and "scenes" in data:
+        scenes = data["scenes"]
+        _write_cache(_scenes_path(song_id), {"version": SCENES_VERSION, "scenes": scenes})
+    return align, scenes
 
 
 def apply_alignment(ly, data):

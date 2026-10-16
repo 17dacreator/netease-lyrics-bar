@@ -6,7 +6,10 @@ aligned in its own short window, cut at the real vocal onset near its timestamp;
 afterwards every word is snapped onto stretches where the vocals are actually
 sounding.
 
-    python align.py <song_id> <duration_seconds> <lines.json> <out.json>
+    python align.py <song_id> <duration_seconds> <lines.json | -> <out.json> [--scenes [--chinese]]
+
+With --scenes the same separation also labels what's playing (scenes.py) for the
+间奏 display; "-" skips the alignment.
 
 lines.json: [{"start": s, "text": "...", "units": ["...", ...], "first": s?}, ...]: units
 are the display words of the line (they join back into its text); "first" is the
@@ -230,9 +233,13 @@ def align_song(vocals, lines):
 
 
 def main():
-    song_id, duration, lines_path, out_path = sys.argv[1], float(sys.argv[2]), sys.argv[3], sys.argv[4]
-    with open(lines_path, encoding="utf-8") as f:
-        lines = json.load(f)
+    flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    song_id, duration, lines_path, out_path = args[0], float(args[1]), args[2], args[3]
+    lines = None
+    if lines_path != "-":
+        with open(lines_path, encoding="utf-8") as f:
+            lines = json.load(f)
     t0 = time.time()
     result = {}
     try:
@@ -242,9 +249,14 @@ def main():
             result["error"] = "no_cache"
         else:
             tr.stage("vocals")
-            vocals = tr.separate_vocals(audio, rate)
-            tr.stage("align")
-            result["lines"] = align_song(vocals, lines)
+            stems, sr = tr.separate_stems(audio, rate)
+            if lines:
+                tr.stage("align")
+                result["lines"] = align_song(tr.to_16k(stems["vocals"], sr), lines)
+            if "--scenes" in flags:
+                tr.stage("scenes")
+                import scenes
+                result["scenes"] = scenes.label_song(stems, sr, tr.MODELS_DIR, "--chinese" in flags)
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {e}"
     result["elapsed"] = round(time.time() - t0, 1)
