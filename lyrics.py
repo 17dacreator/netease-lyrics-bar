@@ -200,6 +200,18 @@ def estimate_words(line):
     return words
 
 
+SING_PER_SYLLABLE = 1.0       # seconds; 95% of word-timed lines in the cache are sung faster
+
+
+def sung_end(line):
+    """When `line` has surely been sung: its last word's end with real word timing, otherwise a
+    generous guess from its syllables (the estimated words end early on held notes)."""
+    if line.words and not line.estimated:
+        return line.words[-1].end
+    japanese = bool(KANA.search(line.text))
+    return line.start + SING_PER_SYLLABLE * sum(_syllables(u, japanese) for u in tokenize(line.text)) + 0.5
+
+
 def build(api, duration=0.0, source="网易云"):
     yrc = parse_yrc((api.get("yrc") or {}).get("lyric"))
     lrc = parse_lrc((api.get("lrc") or {}).get("lyric"))

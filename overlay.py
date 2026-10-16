@@ -36,7 +36,10 @@ NOTES = {
     "find:listen0": "没找到能用的歌词，正在听这首歌…",
 }
 REVEAL_FADE = 0.09            # seconds a newly revealed word takes to fade in
-GAP_MIN = 4.0                 # seconds without singing before a stretch gets a 间奏 label
+# Seconds without singing before a stretch is labelled 前奏 / 间奏 / 尾奏; through shorter pauses
+# the last line stays up. In the cached word-timed songs pauses between lines run under 10 s and
+# real breaks 12 s and more, with almost nothing in between.
+GAP_LONG = 10.0
 
 # name, sung gradient (top, bottom), unsung colour
 THEMES = [
@@ -241,6 +244,7 @@ class LyricWindow(QWidget):
         self._frame = None
         self._force_paint = True
         self._wake = 0.0
+        self._duration = 0.0
         self._shapes = OrderedDict()
         self._bounds_key, self._bounds_val = None, []
 
@@ -288,7 +292,7 @@ class LyricWindow(QWidget):
         self.next_btn = button("下句", "在下面显示下一句歌词", self.toggle_next, checkable=True)
         self.reveal_btn = button("逐词", "歌词一个词一个词地出来", self.toggle_reveal, checkable=True)
         self.sweep_btn = button("渐变", "唱到哪里，白字就从左到右变成主题色", self.toggle_sweep, checkable=True)
-        self.gap_btn = button("间奏", "没人唱的时候标出「前奏 / 间奏 / 尾奏」", self.toggle_gap, checkable=True)
+        self.gap_btn = button("间奏", "超过 10 秒没人唱时标出「前奏 / 间奏 / 尾奏」", self.toggle_gap, checkable=True)
         button("A−", "字小一点", lambda: self.change_font(-2))
         button("A+", "字大一点", lambda: self.change_font(2))
         self.theme_btn = button("配色 ▾", "选歌词颜色", lambda: None)
@@ -871,6 +875,7 @@ class LyricWindow(QWidget):
 
     def _tick(self):
         state, song_id, duration, pos = self.reader.snapshot()
+        self._duration = duration
         if self.sync is not None and song_id and song_id == self.sync._song:
             pos -= self.sync.correction        # NetEase's progress can run off the sound after a seek
         if song_id != self.song_id:
@@ -963,7 +968,6 @@ class LyricWindow(QWidget):
                 nxt = next((ln for ln in ly.lines[max(i + 1, 0):] if ln.text), None)
                 if not self.cfg["show_next"]:
                     nxt = None
-                cur = ly.lines[i] if i >= 0 else None
                 has_trans = getattr(ly, "_has_trans", None)
                 if has_trans is None:
                     has_trans = ly._has_trans = any(ln.trans for ln in ly.lines)
@@ -975,18 +979,17 @@ class LyricWindow(QWidget):
                     return out + ([(nxt.text, "next")] if nxt else [])
                 gap, gap_wake = self._gap_at(ly, i, t)
                 wake = min(wake, gap_wake)
-                if gap and not (cur is None and t < 4.0 and self.title):
+                shown = self._last_sung(ly, i)     # stays up through pauses and blank lines
+                if gap and not (gap == "前奏" and t < 4.0 and self.title):
                     line1 = (f"（{gap}）", "dim", None, 0.0)
                     rows = under(None)
-                elif cur is None:
+                elif shown is None:
                     line1 = (self.title or "", "dim", None, 0.0) if self.title else None
                     rows = under(None)
-                elif not cur.text or (ly.word_level and t > cur.end + 4.0):
-                    rows = under(None)
                 else:
-                    line1, line_wake = self._compose_current(cur, t, size1, avail)
+                    line1, line_wake = self._compose_current(shown, t, size1, avail)
                     wake = min(wake, line_wake)
-                    rows = under(cur.trans or None)
+                    rows = under(shown.trans or None)
 
         toast = None
         if now < self.toast_until:
@@ -1012,8 +1015,6 @@ class LyricWindow(QWidget):
             progress = self._word_progress(self._bounds(cur.text, size, words), words, t)
             if t < words[-1].end:
                 wake = 0.0
-            elif not cur.estimated:
-                wake = cur.end + 4.0 - t
         focus = progress if progress is not None else \
             width * (t - cur.start) / max(cur.end - cur.start, 0.1)
         reveal = None
@@ -1052,32 +1053,71 @@ class LyricWindow(QWidget):
         mode = "sung" if progress is None else "karaoke"
         return (cur.text, mode, None if progress is None else round(progress, 1), scroll, reveal), wake
 
-    def _gap_at(self, ly, i, t):
-        """('前奏'/'间奏'/'尾奏' or None, seconds until that can change) for lyric time t."""
-        if self.cfg["gap_label"] == "off":
-            return None, 1e9
+    @staticmethod
+    def _sung_lines(ly):
+        """Indices of the lines with text, cached on the lyrics."""
         sung = getattr(ly, "_sung", None)
         if sung is None:
             sung = ly._sung = [k for k, ln in enumerate(ly.lines) if ln.text.strip()]
+        return sung
+
+    def _last_sung(self, ly, i):
+        """The last line with text that has started by line index i, or None."""
+        sung = self._sung_lines(ly)
+        n = bisect.bisect_right(sung, i)
+        return ly.lines[sung[n - 1]] if n else None
+
+    @staticmethod
+    def _sung_end(ly, k, upto):
+        """When line k has surely been sung. With only estimated word timing, a blank line the
+        lyric puts before line `upto` cuts that short (uploaders mark breaks that way)."""
+        ln = ly.lines[k]
+        end = getattr(ln, "_sung_end", None)
+        if end is None:
+            end = ln.start if lyr.CREDIT.match(ln.text) else lyr.sung_end(ln)     # "作词 : ..." isn't sung
+            if ln.estimated or not ln.words:
+                blank = next((ly.lines[j].start for j in range(k + 1, upto)
+                              if not ly.lines[j].text.strip() and ly.lines[j].start > ln.start), None)
+                if blank is not None:
+                    end = min(end, blank)
+            ln._sung_end = end
+        return end
+
+    def _gap_at(self, ly, i, t):
+        """('前奏'/'间奏'/'尾奏' or None, seconds until that can change) for lyric time t.
+
+        Only a real break is labelled: GAP_LONG seconds or more without singing. Through
+        shorter pauses the last line simply stays up until the next one starts.
+        """
+        if self.cfg["gap_label"] == "off":
+            return None, 1e9
+        sung = self._sung_lines(ly)
         if not sung:
             return None, 1e9
-        nxt_k = next((k for k in sung if k > i), None)
-        nxt_start = ly.lines[nxt_k].start if nxt_k is not None else None
-        if i < sung[0]:                                   # before anyone sings
+        n = bisect.bisect_right(sung, i)                 # sung[n - 1]: the last line that has started
+        if n == 0:                                       # before anyone sings
             first = ly.lines[sung[0]].start
-            if first >= GAP_MIN and t < first:
+            if first >= GAP_LONG and t < first:
                 return "前奏", first - t
             return None, 1e9
-        last_k = max(k for k in sung if k <= i)
-        last = ly.lines[last_k]
-        end = last.words[-1].end if last.words else last.start + 3.0
-        if nxt_start is None:
-            return ("尾奏", 1e9) if t > end + 2.0 else (None, end + 2.0 - t)
-        if nxt_start - end >= GAP_MIN:
-            if end + 0.8 < t < nxt_start:          # hold the label until the next line takes over
-                return "间奏", nxt_start - t
-            if t <= end + 0.8:
-                return None, end + 0.8 - t
+        end = self._sung_end(ly, sung[n - 1], sung[n] if n < len(sung) else len(ly.lines))
+        if n < len(sung):
+            first_real = getattr(ly, "_first_real", None)
+            if first_real is None:                       # credits ("作词 : ...") come before the singing
+                first_real = ly._first_real = next((k for k in sung if not lyr.CREDIT.match(ly.lines[k].text)),
+                                                   len(ly.lines))
+            stop, label = ly.lines[sung[n]].start, "前奏" if sung[n] <= first_real else "间奏"
+        elif self._duration > 0:
+            stop, label = self._duration, "尾奏"
+        else:                                            # length unknown: wait a full break first
+            return ("尾奏", 1e9) if t > end + GAP_LONG else (None, end + GAP_LONG - t)
+        if stop - end < GAP_LONG:
+            return None, 1e9
+        show = end + 1.0                                 # let the last line linger a moment
+        if t < show:
+            return None, show - t
+        if t < stop:
+            return label, stop - t
         return None, 1e9
 
     @staticmethod
