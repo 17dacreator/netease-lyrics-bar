@@ -91,6 +91,7 @@ class LyricWindow(QWidget):
     changed = Signal()            # lock / visibility / theme / translation toggled
     hidden_by_user = Signal()
     _fetched = Signal(int, str, object, str, str)
+    _calib_status = Signal(str)
 
     def __init__(self, cfg, reader):
         super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
@@ -107,6 +108,7 @@ class LyricWindow(QWidget):
         self.fetch_state = ""         # loading | ok | failed | none
         self._fetch_gen = 0
         self._ai_procs = []
+        self._calib_status.connect(self._on_calib_status)
         self._fetched.connect(self._on_fetched)
 
         self.hovered = False
@@ -162,6 +164,7 @@ class LyricWindow(QWidget):
         self.trans_btn = button("译", "显示翻译", self.toggle_trans, checkable=True)
         self.next_btn = button("下句", "在下面显示下一句歌词", self.toggle_next, checkable=True)
         self.reveal_btn = button("逐词", "歌词一个词一个词地出来", self.toggle_reveal, checkable=True)
+        button("校准", "按这首歌的音频重新对齐每个字的时间", self.calibrate_now)
         button("A−", "字小一点", lambda: self.change_font(-2))
         button("A+", "字大一点", lambda: self.change_font(2))
         button("配色", "换一套颜色", self.next_theme)
@@ -401,6 +404,11 @@ class LyricWindow(QWidget):
         for proc in list(self._ai_procs):
             proc.kill()
 
+    def toggle_calibrate(self):
+        self.cfg["calibrate"] = not self.cfg["calibrate"]
+        self._save_timer.start()
+        self.changed.emit()
+
     def toggle_ai(self):
         self.cfg["ai_transcribe"] = not self.cfg["ai_transcribe"]
         self._save_timer.start()
@@ -446,10 +454,60 @@ class LyricWindow(QWidget):
                     state = "ai_failed"
             if ai and ai.lines:
                 ly, state = ai, "ok"
+        if state == "ok" and self.cfg["calibrate"] and lyr.can_calibrate(ly):
+            cached = lyr.load_alignment(song_id, ly)
+            if cached:
+                ly = lyr.apply_alignment(ly, cached)
+            else:
+                self._fetched.emit(gen, song_id, ly, title, state)     # show them now, refine later
+                self._calibrate(gen, song_id, ly, title, meta, quiet=True)
+                return
         self._fetched.emit(gen, song_id, ly, title, state)
+
+    def _calibrate(self, gen, song_id, ly, title, meta, quiet):
+        def on_stage(stage):
+            if not quiet and gen == self._fetch_gen:
+                self._calib_status.emit(stage)
+        data = lyr.run_alignment(song_id, meta, ly, on_stage, self._ai_procs)
+        if gen != self._fetch_gen:
+            return
+        if data:
+            self._fetched.emit(gen, song_id, lyr.apply_alignment(ly, data), title, "calibrated")
+        elif not quiet:
+            self._calib_status.emit("failed")
+
+    def calibrate_now(self):
+        ly = getattr(self.lyrics, "raw", self.lyrics)
+        if not lyr.can_calibrate(ly):
+            self.toast("这首没有能校准的歌词")
+            return
+        self.stop_ai()
+        gen, song_id, title = self._fetch_gen, self.song_id, self.title
+        _, _, duration, _ = self.reader.snapshot()
+        self.toast("校准中：等缓存…", 30)
+
+        def work():
+            meta = lyr.song_meta(song_id)
+            if duration and not meta["duration"]:
+                meta["duration"] = duration
+            self._calibrate(gen, song_id, ly, title, meta, quiet=False)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_calib_status(self, stage):
+        text = {"audio": "校准中：等缓存…", "vocals": "校准中：分离人声…", "align": "校准中：对齐每个字…",
+                "done": "校准中：整理…", "failed": "校准没成功（这首可能还没缓存好）"}.get(stage)
+        if text:
+            self.toast(text, 3.0 if stage == "failed" else 30)
 
     def _on_fetched(self, gen, song_id, ly, title, state):
         if gen != self._fetch_gen:
+            return
+        if state == "calibrated":
+            self.lyrics, state = ly, "ok"
+            self.fetch_state = state
+            self._force_paint = True
+            n = getattr(ly, "calibrated", 0)
+            self.toast(f"已按音频校准 {n} 句的逐字时间" if n else "已校准：原来的时间就对得上", 2.5)
             return
         self.lyrics, self.title, self.fetch_state = ly, title, state
         self._force_paint = True

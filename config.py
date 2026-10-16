@@ -17,6 +17,7 @@ DEFAULTS = {
     "reveal": True,            # words appear one by one
     "autofill": True,          # look in other lyric libraries when NetEase has none
     "ai_transcribe": True,     # last resort: transcribe the cached audio with Whisper
+    "calibrate": True,         # line word timing up with the audio (once per song, cached)
     "locked": False,
     "visible": True,
     "x": None,

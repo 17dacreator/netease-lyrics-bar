@@ -33,6 +33,7 @@ LRCLIB_SEARCH = "https://lrclib.net/api/search"
 QQ_SEARCH = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp"
 QQ_LYRIC = "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg"
 AI_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transcribe.py")
+ALIGN_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "align.py")
 AI_TIMEOUT = 600             # seconds; the first run also downloads the models
 MISS_TTL = 3 * 24 * 3600     # re-check songs without lyrics after a few days
 DURATION_SLACK = 3.0         # seconds a fallback version may differ from the playing one
@@ -46,6 +47,9 @@ IS_CJK = re.compile(f"[{CJK}]")
 ATOM = re.compile(rf"[{CJK}]|(?:(?![{CJK}])[^\W_])+(?:['’](?:(?![{CJK}])[^\W_])+)*")
 OPENERS = "([{“‘「『《〈（【"
 VOWELS = re.compile(r"[aeiouyàáâãäåèéêëìíîïòóôõöùúûüý]+", re.I)
+KANA = re.compile("[\u3040-\u30ff]")
+KANJI = re.compile("[\u4e00-\u9fff]")
+SMALL_KANA = set("ゃゅょぁぃぅぇぉゎャュョァィゥェォヮ")
 
 
 @dataclass
@@ -151,7 +155,21 @@ def tokenize(text):
     return units
 
 
-def _syllables(unit):
+def _syllables(unit, japanese=False):
+    if japanese and IS_CJK.search(unit):
+        # Japanese is sung by mora: a kanji is usually read as about two kana,
+        # small kana ride on the one before, っ/ー get a short beat.
+        w = 0.0
+        for ch in unit:
+            if KANJI.match(ch):
+                w += 1.8
+            elif ch in SMALL_KANA:
+                w += 0.3
+            elif ch in "ーっッ":
+                w += 0.6
+            elif KANA.match(ch) or IS_CJK.match(ch):
+                w += 1.0
+        return w
     if IS_CJK.search(unit):
         return len(IS_CJK.findall(unit))
     word = re.sub(r"[^a-zA-Zà-ÿ0-9]", "", unit)
@@ -167,7 +185,8 @@ def _syllables(unit):
 
 def estimate_words(line):
     units = tokenize(line.text)
-    weights = [_syllables(u) for u in units]
+    japanese = bool(KANA.search(line.text))
+    weights = [_syllables(u, japanese) for u in units]
     total = sum(weights)
     if not units or total == 0:
         return None
@@ -445,6 +464,116 @@ def run_transcription(song_id, meta, on_stage, holder):
         os.remove(out)           # let the next play try again
         return None
     return load_ai(song_id)
+
+
+# -- auto-calibration: word timing from the audio ----------------------------------------
+
+def _align_path(song_id):
+    return os.path.join(CACHE_DIR, f"{song_id}.align.json")
+
+
+def _signature(ly):
+    import hashlib
+    raw = "\n".join(f"{ln.start:.2f} {ln.text}" for ln in ly.lines)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def can_calibrate(ly):
+    return bool(ly and ly.lines and ly.source != "AI听写" and any(ln.words for ln in ly.lines))
+
+
+def load_alignment(song_id, ly):
+    """Cached alignment for exactly these lyrics, or None."""
+    try:
+        with open(_align_path(song_id), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if data.get("sig") != _signature(ly) or not data.get("lines"):
+        return None
+    return data
+
+
+def run_alignment(song_id, meta, ly, on_stage, holder):
+    """Run align.py for these lyrics (blocking); returns the alignment data or None."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    lines = []
+    for ln in ly.lines:
+        units = [w.text for w in ln.words] if ln.words else tokenize(ln.text)
+        item = {"start": ln.start, "text": ln.text, "units": units}
+        if ln.words and not ln.estimated:
+            item["first"] = ln.words[0].start
+        lines.append(item)
+    req = _align_path(song_id) + ".in.json"
+    with open(req, "w", encoding="utf-8") as f:
+        json.dump(lines, f, ensure_ascii=False)
+    out = _align_path(song_id) + ".out.json"
+    exe = os.path.join(os.path.dirname(sys.executable), "python.exe")
+    proc = subprocess.Popen([exe if os.path.exists(exe) else sys.executable, ALIGN_SCRIPT,
+                             song_id, str(meta["duration"] or 0), req, out],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                            encoding="utf-8", creationflags=subprocess.CREATE_NO_WINDOW)
+    holder.append(proc)
+    timer = threading.Timer(AI_TIMEOUT, proc.kill)
+    timer.start()
+    try:
+        for line in proc.stdout:
+            if line.startswith("STAGE "):
+                on_stage(line[6:].strip())
+        proc.wait()
+    finally:
+        timer.cancel()
+        if proc in holder:
+            holder.remove(proc)
+    try:
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    finally:
+        for p in (req, out):
+            if os.path.exists(p):
+                os.remove(p)
+    if data.get("error") or not data.get("lines"):
+        with open(os.path.join(DATA_DIR, "ai_errors.log"), "a", encoding="utf-8") as log:
+            log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} align {song_id} {data.get('error', 'no lines')}\n")
+        return None
+    data["sig"] = _signature(ly)
+    _write_cache(_align_path(song_id), data)
+    return data
+
+
+def apply_alignment(ly, data):
+    """New Lyrics with audio-based timing.
+
+    Line-only lyrics take the aligned word times outright. Lyrics that already have
+    real word timing keep their own spacing; a line is only shifted as a whole when
+    the source puts its first word in silence and the audio shows a clear onset.
+    """
+    lines, fixed = [], 0
+    for ln, r in zip(ly.lines, data["lines"]):
+        ln = Line(ln.start, ln.end, ln.text, list(ln.words) if ln.words else None, ln.trans, ln.estimated)
+        if r and ln.words:
+            if ln.estimated and len(r["words"]) == len(ln.words):
+                ln.words = [Word(s, e, u) for s, e, u in r["words"]]
+                ln.estimated = False
+                ln.start = min(ln.start, r["start"] - 0.05)
+                fixed += 1
+            elif not ln.estimated and r.get("onset") and r.get("src_silent"):
+                delta = r["start"] - ln.words[0].start
+                if abs(delta) > 0.3:
+                    ln.words = [Word(w.start + delta, w.end + delta, w.text) for w in ln.words]
+                    ln.start, ln.end = ln.start + delta, ln.end + delta
+                    fixed += 1
+        lines.append(ln)
+    for a, b in zip(lines, lines[1:]):               # keep lines in order after moving starts
+        if b.start < a.start + 0.05:
+            b.start = a.start + 0.05
+        if not ly.word_level and a.end > b.start:
+            a.end = b.start
+    out = Lyrics(lines, pure_music=ly.pure_music, word_level=ly.word_level, source=ly.source)
+    out.calibrated, out.raw = fixed, ly        # keep the source timing for a manual re-run
+    return out
 
 
 def fetch_lyrics(song_id, meta, autofill=True):

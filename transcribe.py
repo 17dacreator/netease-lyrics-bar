@@ -125,18 +125,23 @@ def pick_language(model, vocals, hint):
     return hint
 
 
-def transcribe(vocals, hint="", **overrides):
-    import torch
-    torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
-    if os.path.isdir(torch_lib):           # CTranslate2 loads cuBLAS/cuDNN from torch's copy
-        os.add_dll_directory(torch_lib)
-        os.environ["PATH"] = torch_lib + os.pathsep + os.environ.get("PATH", "")
-    from faster_whisper import WhisperModel
+def get_whisper():
+    """The Whisper model, loaded once per process."""
     global _whisper
     if _whisper is None:
+        import torch
+        torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+        if os.path.isdir(torch_lib):       # CTranslate2 loads cuBLAS/cuDNN from torch's copy
+            os.add_dll_directory(torch_lib)
+            os.environ["PATH"] = torch_lib + os.pathsep + os.environ.get("PATH", "")
+        from faster_whisper import WhisperModel
         _whisper = WhisperModel(WHISPER_MODEL, device="cuda", compute_type="float16",
                                 download_root=os.path.join(MODELS_DIR, "whisper"))
-    model = _whisper
+    return _whisper
+
+
+def transcribe(vocals, hint="", **overrides):
+    model = get_whisper()
     options = dict(beam_size=5, word_timestamps=True, vad_filter=True,
                    # Silero VAD is tuned for speech and drops sung phrases at its default
                    # threshold; looser keeps the words while still anchoring timestamps.
