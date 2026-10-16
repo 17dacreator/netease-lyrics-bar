@@ -15,6 +15,11 @@ import lyrics as lyr
 
 user32 = ctypes.windll.user32
 user32.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wt.UINT]
+user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+user32.GetWindowLongPtrW.argtypes = [wt.HWND, ctypes.c_int]
+user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+user32.SetWindowLongPtrW.argtypes = [wt.HWND, ctypes.c_int, ctypes.c_ssize_t]
+GWL_EXSTYLE, WS_EX_TRANSPARENT, WS_EX_LAYERED = -20, 0x20, 0x80000
 
 FONT_FAMILY = "Microsoft YaHei UI"
 TOOLBAR_H = 38
@@ -112,6 +117,7 @@ class LyricWindow(QWidget):
         self._build_toolbar()
         self.bubble = UnlockBubble()
         self.bubble.clicked.connect(lambda: self.set_locked(False))
+        self.bubble.winId()           # create the native window now so the first show is instant
 
         self._save_timer = QTimer(self, singleShot=True, interval=400, timeout=self.cfg.save)
         self._tick_timer = QTimer(self, timerType=Qt.PreciseTimer, interval=8, timeout=self._tick)
@@ -154,7 +160,7 @@ class LyricWindow(QWidget):
         button("A−", "字小一点", lambda: self.change_font(-2))
         button("A+", "字大一点", lambda: self.change_font(2))
         button("配色", "换一套颜色", self.next_theme)
-        button("锁定", "锁定后鼠标可以穿透歌词", lambda: self.set_locked(True))
+        self.lock_btn = button("锁定", "锁定后鼠标可以穿透歌词", lambda: self.set_locked(True))
         button("✕", "隐藏歌词（托盘图标里可以再打开）", self.hide_by_user)
         bar.hide()
         self._refresh_toolbar()
@@ -246,13 +252,12 @@ class LyricWindow(QWidget):
 
     def set_locked(self, on):
         self.cfg["locked"] = bool(on)
-        handle = self.windowHandle()
-        if handle:
-            handle.setFlag(Qt.WindowTransparentForInput, bool(on))
-        if on:
-            self.toolbar.hide()
-        else:
-            self.bubble.hide()
+        self._set_click_through(on)
+        # Swap the controls right away when the cursor is on the bar, so lock and unlock
+        # can be clicked back and forth in the same spot.
+        self.hovered = self.isVisible() and self.frameGeometry().contains(QCursor.pos())
+        self._hover_left_at = 0.0
+        self._sync_controls()
         self.toast("已锁定" if on else "已解锁")
         self._save_timer.start()
         self.changed.emit()
@@ -318,6 +323,8 @@ class LyricWindow(QWidget):
 
     def _layout_toolbar(self):
         self.toolbar.setGeometry(0, 0, self.width(), TOOLBAR_H)
+        # Lay the buttons out even while hidden: the unlock button is placed over the lock button.
+        self.toolbar.layout().setGeometry(self.toolbar.rect())
 
     def resizeEvent(self, e):
         self._layout_toolbar()
@@ -330,6 +337,15 @@ class LyricWindow(QWidget):
         if self.isVisible():
             self.cfg["x"], self.cfg["y"], self.cfg["width"] = self.x(), self.y(), self.width()
             self._save_timer.start()
+
+    def _set_click_through(self, on):
+        # Flip the extended style directly: Qt's setFlag re-applies every window flag
+        # and makes the translucent window recompose.
+        hwnd = int(self.winId())
+        style = user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+        new = (style | WS_EX_TRANSPARENT | WS_EX_LAYERED) if on else (style & ~WS_EX_TRANSPARENT)
+        if new != style:
+            user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new)
 
     def _keep_topmost(self):
         if self.isVisible():
@@ -416,27 +432,35 @@ class LyricWindow(QWidget):
         self._tick_timer.setInterval(8 if wake <= 0.008 else min(50, math.ceil(wake * 1000)))
 
     def _update_hover(self):
-        now = time.monotonic()
-        inside = self.frameGeometry().contains(QCursor.pos())
-        if self.cfg["locked"] and self.bubble.isVisible():
-            inside = inside or self.bubble.frameGeometry().contains(QCursor.pos())
+        pos = QCursor.pos()
+        inside = self.frameGeometry().contains(pos)
+        if self.bubble.isVisible():
+            inside = inside or self.bubble.frameGeometry().contains(pos)
         if inside:
-            self._hover_left_at = 0.0
-            if not self.hovered:
-                self.hovered = True
-                if self.cfg["locked"]:
-                    g = self.frameGeometry()
-                    self.bubble.move(g.right() - self.bubble.width() - 10, g.top() + 6)
-                    self.bubble.show()
-                    user32.SetWindowPos(int(self.bubble.winId()), wt.HWND(-1), 0, 0, 0, 0, 0x13)
-                else:
-                    self.toolbar.show()
+            self.hovered, self._hover_left_at = True, 0.0
         elif self.hovered:
+            now = time.monotonic()
             if not self._hover_left_at:
                 self._hover_left_at = now
             elif now - self._hover_left_at > 0.5:
                 self.hovered = False
-                self.toolbar.hide()
+        self._sync_controls()
+
+    def _sync_controls(self):
+        """Toolbar while hovered and unlocked; just the unlock button while hovered and locked."""
+        locked = self.cfg["locked"]
+        want_bar = self.hovered and not locked
+        want_bubble = self.hovered and locked and self.isVisible()
+        if self.toolbar.isVisible() != want_bar:
+            self.toolbar.setVisible(want_bar)
+        if self.bubble.isVisible() != want_bubble:
+            if want_bubble:
+                # Same spot as the lock button it replaces.
+                c = self.lock_btn.mapToGlobal(self.lock_btn.rect().center())
+                self.bubble.move(c.x() - self.bubble.width() // 2, c.y() - self.bubble.height() // 2)
+                self.bubble.show()
+                user32.SetWindowPos(int(self.bubble.winId()), wt.HWND(-1), 0, 0, 0, 0, 0x13)
+            else:
                 self.bubble.hide()
 
     def _compose(self, state, t):
