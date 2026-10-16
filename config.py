@@ -14,6 +14,8 @@ DEFAULTS = {
     "theme": 0,
     "show_trans": True,
     "show_next": True,         # preview the upcoming line under the current one
+    "reveal": True,            # words appear one by one
+    "autofill": True,          # look in other lyric libraries when NetEase has none
     "locked": False,
     "visible": True,
     "x": None,

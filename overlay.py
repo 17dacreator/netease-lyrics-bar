@@ -1,5 +1,6 @@
 """Transparent, always-on-top desktop lyric window."""
 import ctypes
+import bisect
 import ctypes.wintypes as wt
 import math
 import threading
@@ -25,6 +26,7 @@ FONT_FAMILY = "Microsoft YaHei UI"
 TOOLBAR_H = 38
 EDGE = 8
 FONT_MIN, FONT_MAX = 18, 72
+REVEAL_FADE = 0.09            # seconds a newly revealed word takes to fade in
 
 # name, sung gradient (top, bottom), unsung colour
 THEMES = [
@@ -52,7 +54,7 @@ def fmt_offset(v):
 
 class _Shape:
     """A pre-rendered line of text in one colour role, plus its word boundaries."""
-    __slots__ = ("image", "width", "height", "margin", "bounds")
+    __slots__ = ("image", "width", "height", "margin")
 
 
 class OffsetButton(QPushButton):
@@ -113,6 +115,7 @@ class LyricWindow(QWidget):
         self._force_paint = True
         self._wake = 0.0
         self._shapes = OrderedDict()
+        self._bounds_key, self._bounds_val = None, []
 
         self._build_toolbar()
         self.bubble = UnlockBubble()
@@ -157,6 +160,7 @@ class LyricWindow(QWidget):
         row.addStretch(1)
         self.trans_btn = button("译", "显示翻译", self.toggle_trans, checkable=True)
         self.next_btn = button("下句", "在下面显示下一句歌词", self.toggle_next, checkable=True)
+        self.reveal_btn = button("逐词", "歌词一个词一个词地出来", self.toggle_reveal, checkable=True)
         button("A−", "字小一点", lambda: self.change_font(-2))
         button("A+", "字大一点", lambda: self.change_font(2))
         button("配色", "换一套颜色", self.next_theme)
@@ -170,6 +174,7 @@ class LyricWindow(QWidget):
         self.scope_btn.setText("全部歌曲" if self.cfg["scope"] == "all" else "只调这首")
         self.trans_btn.setChecked(bool(self.cfg["show_trans"]))
         self.next_btn.setChecked(bool(self.cfg["show_next"]))
+        self.reveal_btn.setChecked(bool(self.cfg["reveal"]))
 
     # -- offsets -----------------------------------------------------------
 
@@ -221,6 +226,20 @@ class LyricWindow(QWidget):
         self._refresh_toolbar()
         self._save_timer.start()
         self.changed.emit()
+
+    def toggle_reveal(self):
+        self.cfg["reveal"] = not self.cfg["reveal"]
+        self._refresh_toolbar()
+        self._save_timer.start()
+        self.changed.emit()
+
+    def toggle_autofill(self):
+        self.cfg["autofill"] = not self.cfg["autofill"]
+        self._save_timer.start()
+        self.changed.emit()
+        if self.song_id:
+            _, _, duration, _ = self.reader.snapshot()
+            self._load_song(self.song_id, duration)
 
     def toggle_next(self):
         self.cfg["show_next"] = not self.cfg["show_next"]
@@ -310,7 +329,7 @@ class LyricWindow(QWidget):
     def _apply_geometry(self, initial=False):
         h = self._calc_height()
         self.setFixedHeight(h)
-        self.setMinimumWidth(640)
+        self.setMinimumWidth(max(640, self.toolbar.sizeHint().width()))
         avail = QGuiApplication.primaryScreen().availableGeometry()
         w = self.cfg["width"] or int(min(1100, max(700, avail.width() * 0.62)))
         x, y = self.cfg["x"], self.cfg["y"]
@@ -389,12 +408,15 @@ class LyricWindow(QWidget):
         threading.Thread(target=self._fetch_worker, args=(gen, song_id, duration), daemon=True).start()
 
     def _fetch_worker(self, gen, song_id, duration):
-        title = lyr.song_title(song_id)
+        meta = lyr.song_meta(song_id)
+        if duration and not meta["duration"]:
+            meta["duration"] = duration
+        title = lyr.display_title(meta)
         if not song_id.isdigit():
             self._fetched.emit(gen, song_id, None, title, "none")
             return
         try:
-            ly = lyr.fetch_lyrics(song_id, duration)
+            ly = lyr.fetch_lyrics(song_id, meta, autofill=self.cfg["autofill"])
             state = "ok" if ly.lines else "none"
         except Exception:
             ly, state = None, "failed"
@@ -405,6 +427,8 @@ class LyricWindow(QWidget):
             return
         self.lyrics, self.title, self.fetch_state = ly, title, state
         self._force_paint = True
+        if ly and ly.lines and ly.source != "网易云":
+            self.toast(f"网易云没有这首的歌词，已从{ly.source}补上", 3.0)
         if state == "failed":
             QTimer.singleShot(15000, lambda: self._retry(gen))
 
@@ -501,19 +525,8 @@ class LyricWindow(QWidget):
                 elif not cur.text or (ly.word_level and t > cur.end + 4.0):
                     line2 = (nxt.text, "next") if nxt else None
                 else:
-                    if ly.word_level:
-                        shape = self._shape(cur.text, size1, "unsung", cur.words)
-                        progress = self._word_progress(shape, cur.words, t)
-                        line1 = (cur.text, "karaoke", round(progress, 1),
-                                 self._scroll(shape.width, progress, avail))
-                        wake = 0.0 if t < cur.end else min(wake, cur.end + 4.0 - t)
-                    else:
-                        shape = self._shape(cur.text, size1, "sung")
-                        frac = (t - cur.start) / max(cur.end - cur.start, 0.1)
-                        line1 = (cur.text, "sung", None,
-                                 self._scroll(shape.width, frac * shape.width, avail))
-                        if shape.width > avail and t < cur.end:
-                            wake = 0.0
+                    line1, line_wake = self._compose_current(cur, t, size1, avail)
+                    wake = min(wake, line_wake)
                     if self.cfg["show_trans"] and cur.trans:
                         line2 = (cur.trans, "sub")
                     elif nxt:
@@ -527,6 +540,44 @@ class LyricWindow(QWidget):
             line2 = (self._elide(line2[0], size2, avail), line2[1])
         return (line1, line2, state == "paused", show_panel, self.cfg["locked"], self.width())
 
+    def _compose_current(self, cur, t, size, avail):
+        """(line1 tuple, seconds until it changes) for the line being sung.
+
+        Real word timing gets a karaoke fill. In reveal mode the words also appear
+        one by one (estimated timing for line-only lyrics), each fading in briefly.
+        """
+        words = cur.words
+        width = self._shape(cur.text, size, "sung").width
+        wake = 0.05
+        progress = None
+        if words and not cur.estimated:
+            progress = self._word_progress(self._bounds(cur.text, size, words), words, t)
+            wake = 0.0 if t < cur.end else cur.end + 4.0 - t
+        focus = progress if progress is not None else \
+            width * (t - cur.start) / max(cur.end - cur.start, 0.1)
+        reveal = None
+        if self.cfg["reveal"] and words:
+            bounds = self._bounds(cur.text, size, words)
+            k = bisect.bisect_right([w.start for w in words], t)
+            if k < len(words):
+                wake = min(wake, words[k].start - t)
+            if k == 0:
+                reveal = (0.0, 0.0, 0.0)
+            else:
+                age = t - words[k - 1].start
+                alpha = 1.0 if age >= REVEAL_FADE else round(0.3 + 0.7 * age / REVEAL_FADE, 1)
+                if alpha < 1.0:
+                    wake = 0.0
+                if k < len(words) or alpha < 1.0:
+                    left = bounds[k - 2][2] if k >= 2 else 0.0
+                    reveal = (round(left, 1), round(bounds[k - 1][2], 1), alpha)
+                focus = bounds[k - 1][1] if progress is None else min(progress, bounds[k - 1][1])
+        scroll = self._scroll(width, focus, avail)
+        if width > avail and t < cur.end and progress is None and not self.cfg["reveal"]:
+            wake = 0.0
+        mode = "sung" if progress is None else "karaoke"
+        return (cur.text, mode, None if progress is None else round(progress, 1), scroll, reveal), wake
+
     @staticmethod
     def _scroll(width, progress_px, avail):
         if width <= avail:
@@ -534,9 +585,9 @@ class LyricWindow(QWidget):
         return round(max(0.0, min(width - avail, progress_px - avail * 0.45)), 1)
 
     @staticmethod
-    def _word_progress(shape, words, t):
+    def _word_progress(bounds, words, t):
         x = 0.0
-        for (x0, x1), w in zip(shape.bounds, words):
+        for (x0, x1, _), w in zip(bounds, words):
             if t >= w.end:
                 x = x1
             elif t > w.start:
@@ -565,7 +616,28 @@ class LyricWindow(QWidget):
             self._elide_val = QFontMetricsF(self._font(size)).elidedText(text, Qt.ElideRight, avail)
         return self._elide_val
 
-    def _shape(self, text, size, role, words=None):
+    def _bounds(self, text, size, words):
+        """[(x0, x1, edge)] per word in text coordinates.
+
+        x0..x1 is the word's advance including trailing spaces; `edge` is where a
+        reveal should cut it off: the end of the glyphs plus their outline, so the
+        next word's outline never peeks into the gap.
+        """
+        key = (text, size, len(words))
+        if self._bounds_key != key:
+            fm = QFontMetricsF(self._font(size))
+            glow = max(2.0, size * 0.075) * 1.3
+            acc, bounds = "", []
+            for w in words:
+                x0 = fm.horizontalAdvance(acc)
+                ink = fm.horizontalAdvance(acc + w.text.rstrip())
+                acc += w.text
+                x1 = fm.horizontalAdvance(acc)
+                bounds.append((x0, x1, min(x1, ink + glow) if w.text != w.text.rstrip() else x1))
+            self._bounds_key, self._bounds_val = key, bounds
+        return self._bounds_val
+
+    def _shape(self, text, size, role):
         dpr = self.devicePixelRatioF()
         key = (text, size, role, self.cfg["theme"], dpr)
         shape = self._shapes.get(key)
@@ -603,13 +675,6 @@ class LyricWindow(QWidget):
 
         shape = _Shape()
         shape.image, shape.width, shape.height, shape.margin = img, width, height, margin
-        shape.bounds = []
-        if words:
-            acc = ""
-            for w in words:
-                x0 = fm.horizontalAdvance(acc)
-                acc += w.text
-                shape.bounds.append((x0, fm.horizontalAdvance(acc)))
         self._shapes[key] = shape
         while len(self._shapes) > 48:
             self._shapes.popitem(last=False)
@@ -635,7 +700,8 @@ class LyricWindow(QWidget):
         if paused:
             p.setOpacity(0.55)
         if line1:
-            text, mode, progress, scroll = line1
+            text, mode, progress, scroll, *rest = line1
+            reveal = rest[0] if rest else None
             if mode == "karaoke":
                 base = self._shape(text, size1, "unsung")
                 lit = self._shape(text, size1, "sung")
@@ -643,12 +709,28 @@ class LyricWindow(QWidget):
                 base, lit = self._shape(text, size1, mode), None
             x = self._x_for(base, scroll, w)
             y = top1 + (h1 - base.height) / 2 - base.margin
+            ox = x + base.margin              # where the text itself starts
+
+            def draw(left, right, alpha=1.0):
+                p.save()
+                p.setClipRect(QRectF(left, 0, max(right - left, 0), h), Qt.IntersectClip)
+                p.setOpacity(p.opacity() * alpha)
+                p.drawImage(QPointF(x, y), base.image)
+                if lit and progress:
+                    p.setClipRect(QRectF(x, 0, ox + progress - x, h), Qt.IntersectClip)
+                    p.drawImage(QPointF(x, y), lit.image)
+                p.restore()
+
             p.save()
             p.setClipRect(clip)
-            p.drawImage(QPointF(x, y), base.image)
-            if lit and progress > 0:
-                p.setClipRect(QRectF(x, 0, lit.margin + progress, h), Qt.IntersectClip)
-                p.drawImage(QPointF(x, y), lit.image)
+            if reveal is None:
+                draw(x, x + base.image.width())
+            else:
+                x0, x1, alpha = reveal
+                if x0 > 0:
+                    draw(x, ox + x0)
+                if alpha > 0:
+                    draw(ox + x0, ox + x1, alpha)
             p.restore()
         if line2:
             text, role = line2

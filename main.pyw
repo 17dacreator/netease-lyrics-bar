@@ -115,6 +115,9 @@ class Tray(QSystemTrayIcon):
         self.act_lock = self._action("锁定（鼠标穿透）", lambda on: window.set_locked(on), checkable=True)
         self.act_trans = self._action("显示翻译", lambda _: window.toggle_trans(), checkable=True)
         self.act_next = self._action("显示下一句", lambda _: window.toggle_next(), checkable=True)
+        self.act_reveal = self._action("逐词出现", lambda _: window.toggle_reveal(), checkable=True)
+        self.act_fill = self._action("网易云没词时自动补歌词", lambda _: window.toggle_autofill(),
+                                     checkable=True)
         theme_menu = menu.addMenu("配色")
         self.theme_group = QActionGroup(self)
         for i, (name, *_rest) in enumerate(THEMES):
@@ -155,6 +158,8 @@ class Tray(QSystemTrayIcon):
         self.act_lock.setChecked(cfg["locked"])
         self.act_trans.setChecked(cfg["show_trans"])
         self.act_next.setChecked(cfg["show_next"])
+        self.act_reveal.setChecked(cfg["reveal"])
+        self.act_fill.setChecked(cfg["autofill"])
         self.theme_group.actions()[cfg["theme"]].setChecked(True)
         self.act_boot.setChecked(os.path.exists(os.path.join(STARTUP_DIR, SHORTCUT_NAME)))
 
