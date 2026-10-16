@@ -118,6 +118,7 @@ class Tray(QSystemTrayIcon):
         self.act_reveal = self._action("逐词出现", lambda _: window.toggle_reveal(), checkable=True)
         self.act_fill = self._action("网易云没词时自动补歌词", lambda _: window.toggle_autofill(),
                                      checkable=True)
+        self.act_ai = self._action("哪儿都没词时用 AI 听写", lambda _: window.toggle_ai(), checkable=True)
         theme_menu = menu.addMenu("配色")
         self.theme_group = QActionGroup(self)
         for i, (name, *_rest) in enumerate(THEMES):
@@ -160,6 +161,7 @@ class Tray(QSystemTrayIcon):
         self.act_next.setChecked(cfg["show_next"])
         self.act_reveal.setChecked(cfg["reveal"])
         self.act_fill.setChecked(cfg["autofill"])
+        self.act_ai.setChecked(cfg["ai_transcribe"])
         self.theme_group.actions()[cfg["theme"]].setChecked(True)
         self.act_boot.setChecked(os.path.exists(os.path.join(STARTUP_DIR, SHORTCUT_NAME)))
 
@@ -241,6 +243,7 @@ def main():
         cfg["first_run"] = False
         cfg.save()
     code = app.exec()
+    window.stop_ai()
     reader.stop()
     cfg.save()
     return code

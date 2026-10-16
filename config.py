@@ -16,6 +16,7 @@ DEFAULTS = {
     "show_next": True,         # preview the upcoming line under the current one
     "reveal": True,            # words appear one by one
     "autofill": True,          # look in other lyric libraries when NetEase has none
+    "ai_transcribe": True,     # last resort: transcribe the cached audio with Whisper
     "locked": False,
     "visible": True,
     "x": None,

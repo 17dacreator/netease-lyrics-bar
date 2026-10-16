@@ -106,6 +106,7 @@ class LyricWindow(QWidget):
         self.lyrics = None
         self.fetch_state = ""         # loading | ok | failed | none
         self._fetch_gen = 0
+        self._ai_procs = []
         self._fetched.connect(self._on_fetched)
 
         self.hovered = False
@@ -396,7 +397,20 @@ class LyricWindow(QWidget):
 
     # -- song / lyric loading ------------------------------------------------
 
+    def stop_ai(self):
+        for proc in list(self._ai_procs):
+            proc.kill()
+
+    def toggle_ai(self):
+        self.cfg["ai_transcribe"] = not self.cfg["ai_transcribe"]
+        self._save_timer.start()
+        self.changed.emit()
+        if self.cfg["ai_transcribe"] and self.song_id and self.fetch_state == "none":
+            _, _, duration, _ = self.reader.snapshot()
+            self._load_song(self.song_id, duration)
+
     def _load_song(self, song_id, duration):
+        self.stop_ai()               # the listener moved on; don't burn the GPU on the old song
         self.song_id, self.title, self.lyrics = song_id, "", None
         self._fetch_gen += 1
         self._refresh_toolbar()
@@ -420,6 +434,18 @@ class LyricWindow(QWidget):
             state = "ok" if ly.lines else "none"
         except Exception:
             ly, state = None, "failed"
+        if state == "none" and not ly.pure_music and self.cfg["ai_transcribe"]:
+            ai = lyr.load_ai(song_id)
+            if ai is None and gen == self._fetch_gen:
+                self._fetched.emit(gen, song_id, None, title, "ai:audio")
+                ai = lyr.run_transcription(
+                    song_id, meta,
+                    lambda st: self._fetched.emit(gen, song_id, None, title, "ai:" + st),
+                    self._ai_procs)
+                if ai is None:
+                    state = "ai_failed"
+            if ai and ai.lines:
+                ly, state = ai, "ok"
         self._fetched.emit(gen, song_id, ly, title, state)
 
     def _on_fetched(self, gen, song_id, ly, title, state):
@@ -427,7 +453,9 @@ class LyricWindow(QWidget):
             return
         self.lyrics, self.title, self.fetch_state = ly, title, state
         self._force_paint = True
-        if ly and ly.lines and ly.source != "网易云":
+        if ly and ly.lines and ly.source == "AI听写":
+            self.toast("哪儿都没有这首的歌词，已用 AI 听写（可能有听错的地方）", 3.5)
+        elif ly and ly.lines and ly.source != "网易云":
             self.toast(f"网易云没有这首的歌词，已从{ly.source}补上", 3.0)
         if state == "failed":
             QTimer.singleShot(15000, lambda: self._retry(gen))
@@ -507,7 +535,12 @@ class LyricWindow(QWidget):
             ly = self.lyrics
             if not ly or not ly.lines or ly.pure_music:
                 line1 = (self.title or "…", "plain", None, 0.0)
-                note = {"failed": "歌词加载失败，稍后自动重试", "none": "暂无歌词"}.get(self.fetch_state, "")
+                note = {"failed": "歌词加载失败，稍后自动重试", "none": "暂无歌词",
+                        "ai:audio": "AI 听写：等网易云把这首歌缓存好…",
+                        "ai:vocals": "AI 听写：分离人声…",
+                        "ai:words": "AI 听写：识别歌词…",
+                        "ai:done": "AI 听写：整理中…",
+                        "ai_failed": "暂无歌词（AI 听写没成功）"}.get(self.fetch_state, "")
                 if ly and ly.pure_music:
                     note = "纯音乐"
                 line2 = (note, "next") if note else None

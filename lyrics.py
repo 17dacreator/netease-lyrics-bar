@@ -10,6 +10,9 @@ import html
 import json
 import os
 import re
+import subprocess
+import sys
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -29,6 +32,8 @@ LRCLIB_GET = "https://lrclib.net/api/get"
 LRCLIB_SEARCH = "https://lrclib.net/api/search"
 QQ_SEARCH = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp"
 QQ_LYRIC = "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg"
+AI_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transcribe.py")
+AI_TIMEOUT = 600             # seconds; the first run also downloads the models
 MISS_TTL = 3 * 24 * 3600     # re-check songs without lyrics after a few days
 DURATION_SLACK = 3.0         # seconds a fallback version may differ from the playing one
 
@@ -379,6 +384,67 @@ def find_elsewhere(song_id, meta):
     if errors < len(FALLBACKS):          # only remember a miss if the lookups actually ran
         _write_cache(path, {"source": None})
     return None, None
+
+
+# -- AI transcription (last resort) --------------------------------------------------
+
+def _ai_path(song_id):
+    return os.path.join(CACHE_DIR, f"{song_id}.ai.json")
+
+
+def load_ai(song_id):
+    """Lyrics from a finished transcription, or None if there is none (or it failed)."""
+    try:
+        with open(_ai_path(song_id), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if data.get("error"):
+        return None
+    lines = [Line(d["start"], d["end"], "".join(w[2] for w in d["words"]),
+                  [Word(s, e, t) for s, e, t in d["words"]]) for d in data.get("lines") or []]
+    return Lyrics(lines, word_level=True, source="AI听写")
+
+
+def run_transcription(song_id, meta, on_stage, holder):
+    """Run transcribe.py for one song (blocking) and return its Lyrics, or None.
+
+    `holder` receives the Popen so the caller can kill it when the song changes.
+    """
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    out = _ai_path(song_id)
+    exe = os.path.join(os.path.dirname(sys.executable), "python.exe")
+    script_text = meta["title"] + " " + " ".join(meta["artists"])
+    hint = "ja" if re.search("[\u3040-\u30ff]", script_text) else \
+        "ko" if re.search("[\uac00-\ud7af]", script_text) else \
+        "zh" if re.search("[\u4e00-\u9fff]", script_text) else ""
+    proc = subprocess.Popen([exe if os.path.exists(exe) else sys.executable, AI_SCRIPT,
+                             song_id, str(meta["duration"] or 0), out, hint],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                            encoding="utf-8", creationflags=subprocess.CREATE_NO_WINDOW)
+    holder.append(proc)
+    timer = threading.Timer(AI_TIMEOUT, proc.kill)
+    timer.start()
+    try:
+        for line in proc.stdout:
+            if line.startswith("STAGE "):
+                on_stage(line[6:].strip())
+        proc.wait()
+    finally:
+        timer.cancel()
+        if proc in holder:
+            holder.remove(proc)
+    try:
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if data.get("error"):
+        with open(os.path.join(DATA_DIR, "ai_errors.log"), "a", encoding="utf-8") as log:
+            log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {song_id} {data['error']}\n")
+        os.remove(out)           # let the next play try again
+        return None
+    return load_ai(song_id)
 
 
 def fetch_lyrics(song_id, meta, autofill=True):
