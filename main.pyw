@@ -114,6 +114,7 @@ class Tray(QSystemTrayIcon):
         self.act_show = self._action("显示歌词", lambda on: window.set_visible(on), checkable=True)
         self.act_lock = self._action("锁定（鼠标穿透）", lambda on: window.set_locked(on), checkable=True)
         self.act_trans = self._action("显示翻译", lambda _: window.toggle_trans(), checkable=True)
+        self.act_next = self._action("显示下一句", lambda _: window.toggle_next(), checkable=True)
         theme_menu = menu.addMenu("配色")
         self.theme_group = QActionGroup(self)
         for i, (name, *_rest) in enumerate(THEMES):
@@ -153,6 +154,7 @@ class Tray(QSystemTrayIcon):
         self.act_show.setChecked(cfg["visible"])
         self.act_lock.setChecked(cfg["locked"])
         self.act_trans.setChecked(cfg["show_trans"])
+        self.act_next.setChecked(cfg["show_next"])
         self.theme_group.actions()[cfg["theme"]].setChecked(True)
         self.act_boot.setChecked(os.path.exists(os.path.join(STARTUP_DIR, SHORTCUT_NAME)))
 

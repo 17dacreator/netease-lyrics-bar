@@ -150,6 +150,7 @@ class LyricWindow(QWidget):
         self.scope_btn = button("", "点一下切换：调全部歌曲 / 只调这首", self.toggle_scope)
         row.addStretch(1)
         self.trans_btn = button("译", "显示翻译", self.toggle_trans, checkable=True)
+        self.next_btn = button("下句", "在下面显示下一句歌词", self.toggle_next, checkable=True)
         button("A−", "字小一点", lambda: self.change_font(-2))
         button("A+", "字大一点", lambda: self.change_font(2))
         button("配色", "换一套颜色", self.next_theme)
@@ -162,6 +163,7 @@ class LyricWindow(QWidget):
         self.offset_btn.setText(fmt_offset(self._scope_value()))
         self.scope_btn.setText("全部歌曲" if self.cfg["scope"] == "all" else "只调这首")
         self.trans_btn.setChecked(bool(self.cfg["show_trans"]))
+        self.next_btn.setChecked(bool(self.cfg["show_next"]))
 
     # -- offsets -----------------------------------------------------------
 
@@ -210,6 +212,12 @@ class LyricWindow(QWidget):
 
     def toggle_trans(self):
         self.cfg["show_trans"] = not self.cfg["show_trans"]
+        self._refresh_toolbar()
+        self._save_timer.start()
+        self.changed.emit()
+
+    def toggle_next(self):
+        self.cfg["show_next"] = not self.cfg["show_next"]
         self._refresh_toolbar()
         self._save_timer.start()
         self.changed.emit()
@@ -460,6 +468,8 @@ class LyricWindow(QWidget):
                 if i + 1 < len(ly.lines):
                     wake = min(wake, ly.lines[i + 1].start - t)
                 nxt = next((ln for ln in ly.lines[max(i + 1, 0):] if ln.text), None)
+                if not self.cfg["show_next"]:
+                    nxt = None
                 cur = ly.lines[i] if i >= 0 else None
                 if cur is None:
                     line1 = (self.title or "", "dim", None, 0.0) if self.title else None

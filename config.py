@@ -13,6 +13,7 @@ DEFAULTS = {
     "font_size": 34,
     "theme": 0,
     "show_trans": True,
+    "show_next": True,         # preview the upcoming line under the current one
     "locked": False,
     "visible": True,
     "x": None,
