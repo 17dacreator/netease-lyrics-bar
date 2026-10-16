@@ -10,7 +10,7 @@ from collections import OrderedDict
 from PySide6.QtCore import Qt, QObject, QTimer, QRect, QRectF, QPoint, QPointF, QEvent, Signal
 from PySide6.QtGui import (QPainter, QPainterPath, QFont, QFontMetricsF, QColor, QPen, QLinearGradient,
                            QCursor, QGuiApplication, QImage)
-from PySide6.QtGui import QIcon, QPixmap
+from PySide6.QtGui import QIcon, QPixmap, QFontDatabase, QRawFont
 from PySide6.QtWidgets import (QWidget, QPushButton, QHBoxLayout, QMenu, QColorDialog, QProxyStyle, QStyle,
                                QLabel)
 
@@ -54,6 +54,66 @@ THEMES = [
 ]
 CUSTOM = len(THEMES)          # cfg["theme"] value for the user's own colour
 
+# Lyric fonts offered first in the 字体 menu: the first installed family of each entry.
+FONTS = [
+    ("微软雅黑", ["Microsoft YaHei UI", "Microsoft YaHei"]),
+    ("黑体", ["SimHei"]),
+    ("等线", ["DengXian"]),
+    ("宋体", ["SimSun"]),
+    ("仿宋", ["FangSong"]),
+    ("楷体", ["KaiTi"]),
+    ("思源黑体", ["Source Han Sans SC", "Source Han Sans CN", "Noto Sans SC"]),
+    ("思源宋体", ["Source Han Serif SC", "Source Han Serif CN", "Noto Serif SC"]),
+    ("幼圆", ["YouYuan"]),
+    ("隶书", ["LiSu"]),
+    ("华文行楷", ["STXingkai"]),
+    ("华文新魏", ["STXinwei"]),
+    ("方正舒体", ["FZShuTi"]),
+    ("方正姚体", ["FZYaoti"]),
+]
+SKIP_FONTS = ("System", "Terminal", "Fixedsys", "Malgun Gothic", "Malgun Gothic Semilight")
+# Weights of fonts already listed; lyrics are drawn bold anyway.
+WEIGHT_WORDS = ("Thin", "ExtraLight", "Light", "DemiLight", "Semilight", "Medium", "SemiBold", "Bold", "Black", "Heavy")
+# These Chinese fonts carry wide typewriter-style Latin letters; English lyrics read better
+# in a matching Latin font, with the Chinese font for the Chinese characters.
+LATIN_PAIR = {"SimHei": "Arial", "SimSun": "Times New Roman", "NSimSun": "Times New Roman",
+              "新宋体": "Times New Roman", "FangSong": "Times New Roman", "KaiTi": "Palatino Linotype"}
+_font_lists = None
+
+
+def font_lists():
+    """([(menu name, family)] for the FONTS on this PC, [other Chinese-capable families]).
+
+    Windows lists many fonts twice (宋体 / SimSun); the copies share their 'head'
+    table, so each font shows once, under its Chinese name when it has one.
+    """
+    global _font_lists
+    if _font_lists is None:
+        have = set(QFontDatabase.families())
+        presets = []
+        for name, families in FONTS:
+            family = next((f for f in families if f in have), None)
+            if family:
+                presets.append((name, family))
+
+        def ident(family):
+            return bytes(QRawFont.fromFont(QFont(family)).fontTable("head"))[:28] or family.encode()
+
+        taken = {ident(f) for _, f in presets}
+        names = {n for n, _ in FONTS} | {f for _, families in FONTS for f in families}   # and their aliases
+        groups = {}
+        for family in QFontDatabase.families(QFontDatabase.SimplifiedChinese):
+            if (family.startswith("@") or family in SKIP_FONTS or family in names
+                    or family.endswith(("-ExtB", "-ExtG")) or family.rsplit(" ", 1)[-1] in WEIGHT_WORDS):
+                continue
+            key = ident(family)
+            if key not in taken:
+                groups.setdefault(key, []).append(family)
+        others = sorted((next((f for f in g if lyr.IS_CJK.search(f)), g[0]) for g in groups.values()),
+                        key=lambda f: (not lyr.IS_CJK.search(f), f.lower()))
+        _font_lists = presets, others
+    return _font_lists
+
 # Popup menus get an explicit look; the default one rendered nearly black on this setup.
 MENU_CSS = """
 QMenu { background: rgba(26,26,32,242); border: 1px solid rgba(255,255,255,45); border-radius: 10px; padding: 6px; }
@@ -62,6 +122,8 @@ QMenu::item:selected { background: rgba(255,255,255,46); color: #ffffff; }
 QMenu::icon { padding-left: 6px; }
 QMenu::separator { height: 1px; background: rgba(255,255,255,40); margin: 5px 8px; }
 """
+# The font menu shows each name in its own font, so its items must not force one.
+FONT_MENU_CSS = MENU_CSS.replace('font: 13px "Microsoft YaHei UI"; ', "") + 'QMenu { font: 13px "Microsoft YaHei UI"; }'
 
 
 def theme_colors(cfg):
@@ -364,6 +426,10 @@ class LyricWindow(QWidget):
         self.theme_menu = styled_menu(self.theme_btn)
         self.theme_menu.aboutToShow.connect(lambda: self.fill_theme_menu(self.theme_menu))
         self.theme_btn.setMenu(self.theme_menu)
+        self.font_btn = button("字体 ▾", "选择歌词字体", lambda: None)
+        self.font_menu = styled_menu(self.font_btn)
+        self.font_menu.aboutToShow.connect(lambda: self.fill_font_menu(self.font_menu))
+        self.font_btn.setMenu(self.font_menu)
         row.addStretch(1)
         # functions
         button("−0.1", "歌词推迟0.1秒", lambda: self.adjust_offset(-0.1))
@@ -514,6 +580,39 @@ class LyricWindow(QWidget):
         else:
             self.cfg["custom_color"] = before[1]
             self.set_theme(before[0])
+
+    def fill_font_menu(self, menu):
+        """(Re)build a font menu: common Chinese fonts on this PC, then 更多字体 with the rest.
+        Every name is shown in its own font."""
+        menu.clear()
+        menu.setStyleSheet(FONT_MENU_CSS)
+        current = self.cfg["font_family"]
+        presets, others = font_lists()
+
+        def add(target, label, family):
+            act = target.addAction(label + ("  ✓" if family == current else ""))
+            f = QFont(family)
+            f.setPixelSize(15)
+            act.setFont(f)
+            act.triggered.connect(lambda _=False, family=family: self.set_font_family(family))
+
+        for name, family in presets:
+            add(menu, name, family)
+        if others:
+            menu.addSeparator()
+            more = menu.addMenu("更多字体" + ("  ✓" if current in others else ""))
+            for family in others:
+                add(more, family, family)
+
+    def set_font_family(self, family):
+        self.cfg["font_family"] = family
+        self._shapes.clear()
+        self._elide_cache.clear()
+        self._bounds_key = None
+        self._relayout()
+        self._force_paint = True
+        self._save_timer.start()
+        self.changed.emit()
 
     def set_theme(self, idx):
         self.cfg["theme"] = idx
@@ -1208,16 +1307,20 @@ class LyricWindow(QWidget):
     _fonts = {}
 
     def _font(self, size):
-        f = self._fonts.get(size)
+        family = self.cfg["font_family"]
+        f = self._fonts.get((family, size))
         if f is None:
-            f = self._fonts[size] = QFont(FONT_FAMILY)
+            f = self._fonts[(family, size)] = QFont(family)
+            latin = LATIN_PAIR.get(family)
+            if latin and QFontDatabase.hasFamily(latin):
+                f.setFamilies([latin, family])
             f.setPixelSize(size)
             f.setWeight(QFont.Weight.Bold)
             f.setStyleStrategy(QFont.PreferAntialias)
         return f
 
     def _elide(self, text, size, avail):
-        key = (text, size, avail)
+        key = (text, size, avail, self.cfg["font_family"])
         hit = self._elide_cache.get(key)
         if hit is None:                 # translation and next line alternate: keep both
             if len(self._elide_cache) > 256:
@@ -1232,7 +1335,7 @@ class LyricWindow(QWidget):
         reveal should cut it off: the end of the glyphs plus their outline, so the
         next word's outline never peeks into the gap.
         """
-        key = (text, size, len(words))
+        key = (text, size, len(words), self.cfg["font_family"])
         if self._bounds_key != key:
             fm = QFontMetricsF(self._font(size))
             glow = max(2.0, size * 0.075) * 1.3
@@ -1248,7 +1351,7 @@ class LyricWindow(QWidget):
 
     def _shape(self, text, size, role):
         dpr = self.devicePixelRatioF()
-        key = (text, size, role, self.cfg["theme"], self.cfg.get("custom_color"), dpr)
+        key = (text, size, role, self.cfg["theme"], self.cfg.get("custom_color"), self.cfg["font_family"], dpr)
         shape = self._shapes.get(key)
         if shape:
             self._shapes.move_to_end(key)

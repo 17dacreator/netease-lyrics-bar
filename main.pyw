@@ -131,6 +131,8 @@ class Tray(QSystemTrayIcon):
                 act.setText(act.text() + "（这个版本没有）")
         theme_menu = menu.addMenu("配色")
         theme_menu.aboutToShow.connect(lambda: window.fill_theme_menu(theme_menu))
+        font_menu = menu.addMenu("字体")
+        font_menu.aboutToShow.connect(lambda: window.fill_font_menu(font_menu))
         menu.addSeparator()
         self._action("全部歌曲偏移归零", lambda _: self._reset_global())
         self._action("回到默认位置", lambda _: window.reset_position())
