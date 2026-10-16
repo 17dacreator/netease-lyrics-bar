@@ -10,7 +10,8 @@ from collections import OrderedDict
 from PySide6.QtCore import Qt, QTimer, QRect, QRectF, QPointF, Signal
 from PySide6.QtGui import (QPainter, QPainterPath, QFont, QFontMetricsF, QColor, QPen, QLinearGradient,
                            QCursor, QGuiApplication, QImage)
-from PySide6.QtWidgets import QWidget, QPushButton, QHBoxLayout
+from PySide6.QtGui import QActionGroup
+from PySide6.QtWidgets import QWidget, QPushButton, QHBoxLayout, QMenu
 
 import lyrics as lyr
 
@@ -27,6 +28,9 @@ TOOLBAR_H = 38
 EDGE = 8
 FONT_MIN, FONT_MAX = 18, 72
 REVEAL_FADE = 0.09            # seconds a newly revealed word takes to fade in
+GAP_MIN = 4.0                 # seconds without singing before a stretch gets a 间奏 label
+GAP_MODES = [("off", "不显示"), ("simple", "只标「前奏 / 间奏 / 尾奏」"),
+             ("detail", "标出在响什么（人声采样、贝斯独奏、唢呐…）")]
 
 # name, sung gradient (top, bottom), unsung colour
 THEMES = [
@@ -43,6 +47,7 @@ QPushButton { color: #f4f4f4; background: rgba(255,255,255,30); border: none; bo
 QPushButton:hover { background: rgba(255,255,255,70); }
 QPushButton:checked { background: rgba(255,70,105,170); }
 QPushButton#offset { min-width: 104px; font-weight: bold; background: rgba(255,255,255,48); }
+QPushButton::menu-indicator { width: 0; }
 """
 
 
@@ -151,6 +156,26 @@ class LyricWindow(QWidget):
             row.addWidget(b)
             return b
 
+        # subtitle style
+        self.trans_btn = button("译", "显示翻译", self.toggle_trans, checkable=True)
+        self.next_btn = button("下句", "在下面显示下一句歌词", self.toggle_next, checkable=True)
+        self.reveal_btn = button("逐词", "歌词一个词一个词地出来", self.toggle_reveal, checkable=True)
+        self.sweep_btn = button("渐变", "唱到哪里，白字就从左到右变成主题色", self.toggle_sweep, checkable=True)
+        self.gap_btn = button("间奏 ▾", "没人唱的时候显示什么", lambda: None, checkable=True)
+        gap_menu = QMenu(self.gap_btn)
+        self.gap_group = QActionGroup(gap_menu)
+        for mode, label in GAP_MODES:
+            act = gap_menu.addAction(label)
+            act.setCheckable(True)
+            act.setData(mode)
+            act.triggered.connect(lambda _=False, m=mode: self.set_gap_label(m))
+            self.gap_group.addAction(act)
+        self.gap_btn.setMenu(gap_menu)
+        button("A−", "字小一点", lambda: self.change_font(-2))
+        button("A+", "字大一点", lambda: self.change_font(2))
+        button("配色", "换一套颜色", self.next_theme)
+        row.addStretch(1)
+        # functions
         button("−0.1", "歌词推迟 0.1 秒", lambda: self.adjust_offset(-0.1))
         button("−0.01", "歌词推迟 0.01 秒", lambda: self.adjust_offset(-0.01))
         self.offset_btn = button("", "滚轮 ±0.01 秒（按住 Shift ±0.1）· 右键归零", lambda: None,
@@ -160,14 +185,7 @@ class LyricWindow(QWidget):
         button("+0.01", "歌词提前 0.01 秒", lambda: self.adjust_offset(0.01))
         button("+0.1", "歌词提前 0.1 秒", lambda: self.adjust_offset(0.1))
         self.scope_btn = button("", "点一下切换：调全部歌曲 / 只调这首", self.toggle_scope)
-        row.addStretch(1)
-        self.trans_btn = button("译", "显示翻译", self.toggle_trans, checkable=True)
-        self.next_btn = button("下句", "在下面显示下一句歌词", self.toggle_next, checkable=True)
-        self.reveal_btn = button("逐词", "歌词一个词一个词地出来", self.toggle_reveal, checkable=True)
         button("校准", "按这首歌的音频重新对齐每个字的时间", self.calibrate_now)
-        button("A−", "字小一点", lambda: self.change_font(-2))
-        button("A+", "字大一点", lambda: self.change_font(2))
-        button("配色", "换一套颜色", self.next_theme)
         self.lock_btn = button("锁定", "锁定后鼠标可以穿透歌词", lambda: self.set_locked(True))
         button("✕", "隐藏歌词（托盘图标里可以再打开）", self.hide_by_user)
         bar.hide()
@@ -178,7 +196,11 @@ class LyricWindow(QWidget):
         self.scope_btn.setText("全部歌曲" if self.cfg["scope"] == "all" else "只调这首")
         self.trans_btn.setChecked(bool(self.cfg["show_trans"]))
         self.next_btn.setChecked(bool(self.cfg["show_next"]))
+        self.gap_btn.setChecked(self.cfg["gap_label"] != "off")
+        for act in self.gap_group.actions():
+            act.setChecked(act.data() == self.cfg["gap_label"])
         self.reveal_btn.setChecked(bool(self.cfg["reveal"]))
+        self.sweep_btn.setChecked(bool(self.cfg["sweep"]))
 
     # -- offsets -----------------------------------------------------------
 
@@ -230,6 +252,19 @@ class LyricWindow(QWidget):
         self._refresh_toolbar()
         self._save_timer.start()
         self.changed.emit()
+
+    def set_gap_label(self, mode):
+        self.cfg["gap_label"] = mode
+        self._refresh_toolbar()
+        self._save_timer.start()
+        self.changed.emit()
+        self._force_paint = True
+
+    def toggle_sweep(self):
+        self.cfg["sweep"] = not self.cfg["sweep"]
+        self._refresh_toolbar()
+        self._save_timer.start()
+        self._force_paint = True
 
     def toggle_reveal(self):
         self.cfg["reveal"] = not self.cfg["reveal"]
@@ -600,7 +635,9 @@ class LyricWindow(QWidget):
                         "ai:done": "AI 听写：整理中…",
                         "ai_failed": "暂无歌词（AI 听写没成功）"}.get(self.fetch_state, "")
                 if ly and ly.pure_music:
-                    note = "纯音乐"
+                    label = self._scene_at(t) if self.cfg["gap_label"] == "detail" else None
+                    note = f"纯音乐（{label}）" if label else "纯音乐"
+                    wake = min(wake, self._scene_wake(t))
                 line2 = (note, "next") if note else None
             else:
                 i = ly.index_at(t)
@@ -610,7 +647,13 @@ class LyricWindow(QWidget):
                 if not self.cfg["show_next"]:
                     nxt = None
                 cur = ly.lines[i] if i >= 0 else None
-                if cur is None:
+                gap, gap_wake = self._gap_at(ly, i, t)
+                wake = min(wake, gap_wake)
+                if gap and not (cur is None and t < 4.0 and self.title):
+                    line1 = (f"（{self._scene_at(t) or gap}）", "dim", None, 0.0)
+                    wake = min(wake, self._scene_wake(t))
+                    line2 = (nxt.text, "next") if nxt else None
+                elif cur is None:
                     line1 = (self.title or "", "dim", None, 0.0) if self.title else None
                     line2 = (nxt.text, "next") if nxt else None
                 elif not cur.text or (ly.word_level and t > cur.end + 4.0):
@@ -641,9 +684,13 @@ class LyricWindow(QWidget):
         width = self._shape(cur.text, size, "sung").width
         wake = 0.05
         progress = None
-        if words and not cur.estimated:
+        if words and self.cfg["sweep"]:
+            # Fill along the word timing; line-only lyrics use the estimated words.
             progress = self._word_progress(self._bounds(cur.text, size, words), words, t)
-            wake = 0.0 if t < cur.end else cur.end + 4.0 - t
+            if t < words[-1].end:
+                wake = 0.0
+            elif not cur.estimated:
+                wake = cur.end + 4.0 - t
         focus = progress if progress is not None else \
             width * (t - cur.start) / max(cur.end - cur.start, 0.1)
         reveal = None
@@ -668,6 +715,51 @@ class LyricWindow(QWidget):
             wake = 0.0
         mode = "sung" if progress is None else "karaoke"
         return (cur.text, mode, None if progress is None else round(progress, 1), scroll, reveal), wake
+
+    def _gap_at(self, ly, i, t):
+        """('前奏'/'间奏'/'尾奏' or None, seconds until that can change) for lyric time t."""
+        if self.cfg["gap_label"] == "off":
+            return None, 1e9
+        sung = getattr(ly, "_sung", None)
+        if sung is None:
+            sung = ly._sung = [k for k, ln in enumerate(ly.lines) if ln.text.strip()]
+        if not sung:
+            return None, 1e9
+        nxt_k = next((k for k in sung if k > i), None)
+        nxt_start = ly.lines[nxt_k].start if nxt_k is not None else None
+        if i < sung[0]:                                   # before anyone sings
+            first = ly.lines[sung[0]].start
+            if first >= GAP_MIN and t < first:
+                return "前奏", first - t
+            return None, 1e9
+        last_k = max(k for k in sung if k <= i)
+        last = ly.lines[last_k]
+        end = last.words[-1].end if last.words else last.start + 3.0
+        if nxt_start is None:
+            return ("尾奏", 1e9) if t > end + 2.0 else (None, end + 2.0 - t)
+        if nxt_start - end >= GAP_MIN:
+            if end + 0.8 < t < nxt_start:          # hold the label until the next line takes over
+                return "间奏", nxt_start - t
+            if t <= end + 0.8:
+                return None, end + 0.8 - t
+        return None, 1e9
+
+    def _scene_at(self, t):
+        """What's playing at t from the audio analysis (detail mode only), or None."""
+        scenes = getattr(self, "scenes", None)
+        if self.cfg["gap_label"] != "detail" or not scenes:
+            return None
+        k = bisect.bisect_right([s[0] for s in scenes], t) - 1
+        if k >= 0 and t < scenes[k][1]:
+            return scenes[k][2]
+        return None
+
+    def _scene_wake(self, t):
+        scenes = getattr(self, "scenes", None)
+        if self.cfg["gap_label"] != "detail" or not scenes:
+            return 1e9
+        edges = [x for s in scenes for x in (s[0], s[1]) if x > t]
+        return min(edges) - t if edges else 1e9
 
     @staticmethod
     def _scroll(width, progress_px, avail):

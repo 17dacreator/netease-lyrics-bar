@@ -78,7 +78,8 @@ def wait_for_audio(song_id, duration, timeout=90.0):
     return None, None
 
 
-def separate_vocals(audio, rate):
+def separate_stems(audio, rate):
+    """Demucs htdemucs: {'drums', 'bass', 'other', 'vocals'} as mono float32 arrays, plus their rate."""
     import torch
     os.environ.setdefault("TORCH_HOME", os.path.join(MODELS_DIR, "torch"))
     from demucs.apply import apply_model
@@ -93,12 +94,23 @@ def separate_vocals(audio, rate):
     mean, std = ref.mean(), ref.std() + 1e-8
     with torch.no_grad():
         sources = apply_model(model, ((wav - mean) / std)[None], device="cuda", split=True,
-                              overlap=0.25, progress=False)[0]
-    vocals = sources[model.sources.index("vocals")] * std + mean
-    mono16k = julius.resample_frac(vocals.mean(0), model.samplerate, 16000)
+                              overlap=0.25, progress=False)[0] * std + mean
+    stems = {name: sources[k].mean(0).cpu().numpy().astype("float32") for k, name in enumerate(model.sources)}
+    sr = model.samplerate
     del model, sources
     torch.cuda.empty_cache()
-    return mono16k.cpu().numpy().astype("float32")
+    return stems, sr
+
+
+def to_16k(mono, rate):
+    import torch
+    import julius
+    return julius.resample_frac(torch.from_numpy(mono), rate, 16000).numpy().astype("float32")
+
+
+def separate_vocals(audio, rate):
+    stems, sr = separate_stems(audio, rate)
+    return to_16k(stems["vocals"], sr)
 
 
 def language_hint(text):

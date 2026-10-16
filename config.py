@@ -15,9 +15,11 @@ DEFAULTS = {
     "show_trans": True,
     "show_next": True,         # preview the upcoming line under the current one
     "reveal": True,            # words appear one by one
+    "sweep": True,             # sung part fills from white to the theme colour, left to right
     "autofill": True,          # look in other lyric libraries when NetEase has none
     "ai_transcribe": True,     # last resort: transcribe the cached audio with Whisper
     "calibrate": True,         # line word timing up with the audio (once per song, cached)
+    "gap_label": "detail",     # instrumental stretches: off | simple (前奏/间奏/尾奏) | detail (what's playing)
     "locked": False,
     "visible": True,
     "x": None,
