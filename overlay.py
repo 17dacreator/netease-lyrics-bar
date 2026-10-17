@@ -1198,18 +1198,16 @@ class LyricWindow(QWidget):
             if k < len(words):
                 wake = min(wake, words[k].start - t)
             if k == 0:
-                reveal = ("", "", 0.0, 0.0)
+                reveal = ("", "", 0.0)
             else:
                 age = t - words[k - 1].start
                 alpha = 1.0 if age >= REVEAL_FADE else round(0.3 + 0.7 * age / REVEAL_FADE, 1)
                 if alpha < 1.0:
                     wake = 0.0
                 if k < len(words) or alpha < 1.0:
-                    # Draw the words sung so far as text of their own (same positions as in the
-                    # full line) instead of cropping the whole line: cropping cut the first
-                    # letter's outline and let the next glyph peek out after brackets.
-                    left = bounds[k - 2][2] if k >= 2 else 0.0
-                    reveal = (prefixes[k - 1], prefixes[k], round(left, 1), alpha)
+                    # The words sung so far are drawn as text of their own (same positions as in
+                    # the full line); the newest one fades in by blending the two prefixes.
+                    reveal = (prefixes[k - 1], prefixes[k], alpha)
                 focus = bounds[k - 1][1] if progress is None else min(progress, bounds[k - 1][1])
         scroll = self._scroll(width, focus, avail)
         if width > avail and t < cur.end and progress is None and not self.cfg["reveal"]:
@@ -1293,7 +1291,7 @@ class LyricWindow(QWidget):
     @staticmethod
     def _word_progress(bounds, words, t):
         x = 0.0
-        for (x0, x1, _), w in zip(bounds, words):
+        for (x0, x1), w in zip(bounds, words):
             if t >= w.end:
                 x = x1
             elif t > w.start:
@@ -1329,23 +1327,16 @@ class LyricWindow(QWidget):
         return hit
 
     def _bounds(self, text, size, words):
-        """[(x0, x1, edge)] per word in text coordinates.
-
-        x0..x1 is the word's advance including trailing spaces; `edge` is where a
-        reveal should cut it off: the end of the glyphs plus their outline, so the
-        next word's outline never peeks into the gap.
-        """
+        """[(x0, x1)] per word in text coordinates: its advance, trailing spaces included
+        (for the sweep and for scrolling; reveals never cut at these)."""
         key = (text, size, len(words), self.cfg["font_family"])
         if self._bounds_key != key:
             fm = QFontMetricsF(self._font(size))
-            glow = max(2.0, size * 0.075) * 1.3
             acc, bounds = "", []
             for w in words:
                 x0 = fm.horizontalAdvance(acc)
-                ink = fm.horizontalAdvance(acc + w.text.rstrip())
                 acc += w.text
-                x1 = fm.horizontalAdvance(acc)
-                bounds.append((x0, x1, min(x1, ink + glow) if w.text != w.text.rstrip() else x1))
+                bounds.append((x0, fm.horizontalAdvance(acc)))
             self._bounds_key, self._bounds_val = key, bounds
         return self._bounds_val
 
@@ -1419,24 +1410,23 @@ class LyricWindow(QWidget):
                 lit = self._shape(text, size1, "sung")
             else:
                 base, lit = self._shape(text, size1, mode), None
-            x = self._x_for(base, scroll, w)
-            y = top1 + (h1 - base.height) / 2 - base.margin
+            x, y = self._line_pos(base, scroll, w, top1, h1)
             ox = x + base.margin              # where the text itself starts
             p.save()
             p.setClipRect(clip)
             if reveal is None:
                 self._draw_line(p, text, mode, size1, x, y, ox, progress, h)
             else:
-                shown, newest, left, alpha = reveal
-                if shown:
-                    self._draw_line(p, shown, mode, size1, x, y, ox, progress, h)
-                if newest and alpha > 0:          # the word fading in, on top
+                before, now, alpha = reveal
+                if not now or alpha <= 0:
+                    pass
+                elif alpha >= 1 or not before:
                     p.save()
-                    if shown:
-                        p.setClipRect(QRectF(ox + left, 0, 1e6, h), Qt.IntersectClip)
                     p.setOpacity(p.opacity() * alpha)
-                    self._draw_line(p, newest, mode, size1, x, y, ox, progress, h)
+                    self._draw_line(p, now, mode, size1, x, y, ox, progress, h)
                     p.restore()
+                else:
+                    self._draw_blend(p, before, now, alpha, mode, size1, x, y, ox, progress, w)
             p.restore()
         y = top1 + h1
         for text, role in rows:
@@ -1477,18 +1467,73 @@ class LyricWindow(QWidget):
         if lit and progress:
             # Split at the sweep point rather than stacking the colour over the white: each
             # side is one complete layer, so the outline never doubles up and a finished
-            # sweep looks exactly like a line drawn without one.
-            cut = ox + progress
+            # sweep looks exactly like a line drawn without one. The split sits on a device
+            # pixel so the two sides neither overlap nor leave a gap (at 125% they did).
+            dpr = self.devicePixelRatioF()
+            cut = math.floor((ox + progress) * dpr + 0.5) / dpr
             p.save()
             p.setClipRect(QRectF(cut, 0, 1e6, h), Qt.IntersectClip)
             p.drawImage(QPointF(x, y), base.image)
             p.restore()
             p.save()
-            p.setClipRect(QRectF(x - 1, 0, cut - x + 1, h), Qt.IntersectClip)
+            p.setClipRect(QRectF(x - 1, 0, cut - (x - 1), h), Qt.IntersectClip)
             p.drawImage(QPointF(x, y), lit.image)
             p.restore()
         else:
             p.drawImage(QPointF(x, y), base.image)
+
+    def _draw_blend(self, p, before, now, alpha, mode, size, x, y, ox, progress, w):
+        """`before` turning into `now` (the same line with one more word) at `alpha`.
+
+        Each is drawn into a scratch strip of its own, then mixed pixel by pixel
+        ((1 - alpha) * before + alpha * now), so everything the two share stays exactly
+        as it is and only the new word appears. Cutting the new word out at an edge
+        measured from font metrics left a sliver missing or an outline doubled in fonts
+        whose glyphs fill the whole em box.
+        """
+        dpr = self.devicePixelRatioF()
+        role = "sung" if mode == "karaoke" else mode
+        a_img, b_img = self._shape(before, size, role).image, self._shape(now, size, role).image
+        # Usually `now` is the wider, but a script that joins letters can make it narrower.
+        area = QRectF(x, y, max(a_img.width(), b_img.width()) / dpr, max(a_img.height(), b_img.height()) / dpr)
+        # The strips use the window's own coordinates (top at 0), so every image lands on
+        # exactly the pixels it would on the window; they are kept for the next frames and
+        # only `area` is cleared and copied out.
+        strip_h = y + area.height() + 2
+        size_px = (int(w * dpr) + 1, int(strip_h * dpr) + 1)
+        strips = getattr(self, "_blend_strips", None)
+        if strips is None or (strips[0].width(), strips[0].height()) != size_px or strips[0].devicePixelRatio() != dpr:
+            strips = self._blend_strips = tuple(QImage(*size_px, QImage.Format_ARGB32_Premultiplied) for _ in range(2))
+            for s in strips:
+                s.setDevicePixelRatio(dpr)
+        for strip, text in zip(strips, (before, now)):
+            q = QPainter(strip)
+            q.setCompositionMode(QPainter.CompositionMode_Source)
+            q.fillRect(area, Qt.transparent)
+            q.setCompositionMode(QPainter.CompositionMode_SourceOver)
+            self._draw_line(q, text, mode, size, x, y, ox, progress, strip_h)
+            q.end()
+        # Source at opacity a gives a * now + (1 - a) * before exactly (Plus with an
+        # opacity does not), once for every pixel of either prefix.
+        q = QPainter(strips[0])
+        q.setClipRect(area)
+        q.setCompositionMode(QPainter.CompositionMode_Source)
+        q.setOpacity(alpha)
+        q.drawImage(QPointF(0, 0), strips[1])
+        q.end()
+        p.save()
+        p.setClipRect(area, Qt.IntersectClip)
+        p.drawImage(QPointF(0, 0), strips[0])
+        p.restore()
+
+    def _line_pos(self, base, scroll, w, top, height):
+        """Top-left of the current line's images (centred in the row at `top`, `height` high),
+        on a whole device pixel: every layer of a reveal then lands on the same pixels (at
+        150% a half pixel rounded differently)."""
+        dpr = self.devicePixelRatioF()
+        x = self._x_for(base, scroll, w)
+        y = top + (height - base.height) / 2 - base.margin
+        return math.floor(x * dpr + 0.5) / dpr, math.floor(y * dpr + 0.5) / dpr
 
     @staticmethod
     def _x_for(shape, scroll, w):
