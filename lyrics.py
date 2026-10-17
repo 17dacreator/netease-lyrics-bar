@@ -684,6 +684,27 @@ def language_hint(meta):
     return ""
 
 
+VOICE_VERSION = 1             # matches worker.VOICE_VERSION; older measurements are redone
+
+
+def _voice_path(song_id):
+    return os.path.join(CACHE_DIR, f"{song_id}.voice.json")
+
+
+def load_voice(song_id):
+    """[[start, end], ...] seconds where someone sings in this song's audio, or None if unmeasured."""
+    try:
+        with open(_voice_path(song_id), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data.get("spans") if data.get("v") == VOICE_VERSION else None
+
+
+def save_voice(song_id, data):
+    _write_cache(_voice_path(song_id), data)
+
+
 def _align_path(song_id):
     return os.path.join(CACHE_DIR, f"{song_id}.align.json")
 

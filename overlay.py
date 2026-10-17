@@ -41,6 +41,10 @@ REVEAL_FADE = 0.09            # seconds a newly revealed word takes to fade in
 # the last line stays up. In the cached word-timed songs pauses between lines run under 10 s and
 # real breaks 12 s and more, with almost nothing in between.
 GAP_LONG = 10.0
+# With the singing measured from the audio (GPU helper), a label also waits for this long a stretch
+# with nobody singing, voice padded by VOICE_PAD s: ad-libs, humming and backing vocals that lyrics
+# leave out no longer get labelled as a break.
+QUIET_MIN, VOICE_PAD = 6.0, 0.5
 
 # name, sung gradient (top, bottom), unsung colour
 THEMES = [
@@ -215,6 +219,17 @@ class OffsetButton(QPushButton):
             super().mousePressEvent(e)
 
 
+class RightClickButton(QPushButton):
+    """A button that also reports right clicks."""
+    right_clicked = Signal()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.RightButton:
+            self.right_clicked.emit()
+        else:
+            super().mousePressEvent(e)
+
+
 class VsyncPump(QObject):
     """Beats in step with the display (DwmFlush), every `divider` refreshes, while switched on.
 
@@ -337,6 +352,7 @@ class LyricWindow(QWidget):
     _find_state = Signal(int, str)
     _found = Signal(int, str, str, bool)
     _calib_event = Signal(int, object, object, str, bool)
+    _voice_event = Signal(int, object)
 
     def __init__(self, cfg, reader, sync=None):
         super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
@@ -357,6 +373,9 @@ class LyricWindow(QWidget):
         self._calib_job = None
         self._calib_announced = False
         self._calib_event.connect(self._on_calib_event)
+        self._voice = None            # where someone sings in this song (from the GPU helper), or None
+        self._quiet_cache = {}
+        self._voice_event.connect(self._on_voice)
         self._fetched.connect(self._on_fetched)
         self._finding = None           # song id 找词 is working on
         self._before_find = ""
@@ -419,7 +438,8 @@ class LyricWindow(QWidget):
         self.next_btn = button("下句", "显示下句歌词", self.toggle_next, checkable=True)
         self.reveal_btn = button("逐词", "歌词逐词出现", self.toggle_reveal, checkable=True)
         self.sweep_btn = button("渐变", "按演唱进度变色", self.toggle_sweep, checkable=True)
-        self.gap_btn = button("间奏", "标出前奏间奏尾奏", self.toggle_gap, checkable=True)
+        self.gap_btn = button("间奏", "", self.toggle_gap, checkable=True, cls=RightClickButton)
+        self.gap_btn.right_clicked.connect(self.toggle_gap_song)
         button("A−", "字体调小", lambda: self.change_font(-2))
         button("A+", "字体调大", lambda: self.change_font(2))
         self.theme_btn = button("配色 ▾", "选择歌词颜色", lambda: None)
@@ -455,6 +475,8 @@ class LyricWindow(QWidget):
         self.trans_btn.setChecked(bool(self.cfg["show_trans"]))
         self.next_btn.setChecked(bool(self.cfg["show_next"]))
         self.gap_btn.setChecked(self.cfg["gap_label"] != "off")
+        self.gap_btn.setProperty("tip", "这首已关间奏 右键恢复" if self.song_id in self.cfg["gap_off_songs"]
+                                else "标出前奏间奏尾奏 右键只关这首")
         self.reveal_btn.setChecked(bool(self.cfg["reveal"]))
         self.sweep_btn.setChecked(bool(self.cfg["sweep"]))
         filled = bool(self.lyrics and self.lyrics.lines and self.lyrics.source != "网易云")
@@ -515,6 +537,22 @@ class LyricWindow(QWidget):
 
     def toggle_gap(self):
         self.cfg["gap_label"] = "off" if self.cfg["gap_label"] != "off" else "simple"
+        self._refresh_toolbar()
+        self._save_timer.start()
+        self._force_paint = True
+
+    def toggle_gap_song(self):
+        """Right-click on 间奏: never label this song's breaks (or label them again)."""
+        if not self.song_id:
+            self.toast("现在没在放歌")
+            return
+        off = self.cfg["gap_off_songs"]
+        if self.song_id in off:
+            off.remove(self.song_id)
+            self.toast("这首歌恢复标间奏", 2.0)
+        else:
+            off.append(self.song_id)
+            self.toast("这首歌不再标间奏", 2.0)
         self._refresh_toolbar()
         self._save_timer.start()
         self._force_paint = True
@@ -782,6 +820,8 @@ class LyricWindow(QWidget):
     def _load_song(self, song_id, duration):
         self.stop_ai()               # the listener moved on; don't spend the GPU on the old song
         self.song_id, self.title, self.lyrics = song_id, "", None
+        self._voice = lyr.load_voice(song_id) if song_id.isdigit() else None
+        self._quiet_cache.clear()
         self._fetch_gen += 1
         self._refresh_toolbar()
         if not song_id:
@@ -821,7 +861,27 @@ class LyricWindow(QWidget):
                 need_align = True
         self._fetched.emit(gen, song_id, ly, title, state)      # show them now, refine below
         if need_align:
-            self._start_calibration(gen, song_id, ly, quiet=True)
+            self._start_calibration(gen, song_id, ly, quiet=True)       # measures the singing too
+        elif (state == "ok" and self.worker.available and self.cfg["calibrate"]
+              and lyr.load_voice(song_id) is None):
+            self._start_voice(gen, song_id, meta["duration"])
+
+    def _start_voice(self, gen, song_id, duration):
+        """Measure where someone sings in this song (once; cached), for the 间奏 labels."""
+        def on_event(msg):
+            if "done" in msg and msg["done"].get("voice"):
+                lyr.save_voice(song_id, msg["done"]["voice"])
+                self._voice_event.emit(gen, msg["done"]["voice"]["spans"])
+            elif msg.get("error") not in (None, "cancelled"):
+                lyr.log_error(song_id, "voice " + msg["error"])
+
+        self._jobs.append(self.worker.submit({"job": "voice", "song": song_id, "duration": duration}, on_event))
+
+    def _on_voice(self, gen, spans):
+        if gen == self._fetch_gen:
+            self._voice = spans
+            self._quiet_cache.clear()
+            self._force_paint = True
 
     # -- 找词: only when the listener asks -------------------------------------
 
@@ -970,6 +1030,9 @@ class LyricWindow(QWidget):
                 self._calib_event.emit(gen, ly, {"lines": list(merged)}, "partial", quiet)
             elif "done" in msg:
                 lyr.save_alignment(song_id, ly, msg["done"])
+                if msg["done"].get("voice"):
+                    lyr.save_voice(song_id, msg["done"]["voice"])
+                    self._voice_event.emit(gen, msg["done"]["voice"]["spans"])
                 self._calib_event.emit(gen, ly, msg["done"], "done", quiet)
             elif "error" in msg:
                 lyr.log_error(song_id, "align " + msg["error"])
@@ -1249,9 +1312,11 @@ class LyricWindow(QWidget):
         """('前奏'/'间奏'/'尾奏' or None, seconds until that can change) for lyric time t.
 
         Only a real break is labelled: GAP_LONG seconds or more without singing. Through
-        shorter pauses the last line simply stays up until the next one starts.
+        shorter pauses the last line simply stays up until the next one starts. When the
+        singing has been measured from the audio, the label also keeps off wherever
+        someone sings (ad-libs, humming, lines the lyrics leave out).
         """
-        if self.cfg["gap_label"] == "off":
+        if self.cfg["gap_label"] == "off" or self.song_id in self.cfg["gap_off_songs"]:
             return None, 1e9
         sung = self._sung_lines(ly)
         if not sung:
@@ -1259,28 +1324,60 @@ class LyricWindow(QWidget):
         n = bisect.bisect_right(sung, i)                 # sung[n - 1]: the last line that has started
         if n == 0:                                       # before anyone sings
             first = ly.lines[sung[0]].start
-            if first >= GAP_LONG and t < first:
-                return "前奏", first - t
-            return None, 1e9
-        end = self._sung_end(ly, sung[n - 1], sung[n] if n < len(sung) else len(ly.lines))
-        if n < len(sung):
-            first_real = getattr(ly, "_first_real", None)
-            if first_real is None:                       # credits ("作词 : ...") come before the singing
-                first_real = ly._first_real = next((k for k in sung if not lyr.CREDIT.match(ly.lines[k].text)),
-                                                   len(ly.lines))
-            stop, label = ly.lines[sung[n]].start, "前奏" if sung[n] <= first_real else "间奏"
-        elif self._duration > 0:
-            stop, label = self._duration, "尾奏"
-        else:                                            # length unknown: wait a full break first
-            return ("尾奏", 1e9) if t > end + GAP_LONG else (None, end + GAP_LONG - t)
+            if first < GAP_LONG:
+                return None, 1e9
+            end, stop, label = -1.0, first, "前奏"        # shown from the start
+        else:
+            end = self._sung_end(ly, sung[n - 1], sung[n] if n < len(sung) else len(ly.lines))
+            if n < len(sung):
+                first_real = getattr(ly, "_first_real", None)
+                if first_real is None:                   # credits ("作词 : ...") come before the singing
+                    first_real = ly._first_real = next(
+                        (k for k in sung if not lyr.CREDIT.match(ly.lines[k].text)), len(ly.lines))
+                stop, label = ly.lines[sung[n]].start, "前奏" if sung[n] <= first_real else "间奏"
+            elif self._duration > 0:
+                stop, label = self._duration, "尾奏"
+            else:                                        # length unknown: wait a full break first
+                return ("尾奏", 1e9) if t > end + GAP_LONG else (None, end + GAP_LONG - t)
         if stop - end < GAP_LONG:
             return None, 1e9
         show = end + 1.0                                 # let the last line linger a moment
+        if self._voice is not None:                      # only where nobody actually sings
+            for lo, hi in self._quiet_runs(show, stop):
+                if t < lo:
+                    return None, lo - t
+                if t < hi:
+                    return label, hi - t
+            return None, 1e9
         if t < show:
             return None, show - t
         if t < stop:
             return label, stop - t
         return None, 1e9
+
+    def _quiet_runs(self, lo, hi):
+        """Stretches within [lo, hi) at least QUIET_MIN long with nobody singing (cached)."""
+        key = (round(lo, 2), round(hi, 2))
+        runs = self._quiet_cache.get(key)
+        if runs is None:
+            spans = self._voice
+            k = max(0, bisect.bisect_left([s for s, _ in spans], lo - VOICE_PAD) - 1)
+            runs, cur = [], lo
+            for s, e in spans[k:]:
+                s, e = s - VOICE_PAD, e + VOICE_PAD
+                if s >= hi:
+                    break
+                if e <= cur:
+                    continue
+                if s - cur >= QUIET_MIN:
+                    runs.append((cur, min(s, hi)))
+                cur = max(cur, e)
+            if hi - cur >= QUIET_MIN:
+                runs.append((cur, hi))
+            if len(self._quiet_cache) > 64:
+                self._quiet_cache.clear()
+            self._quiet_cache[key] = runs
+        return runs
 
     @staticmethod
     def _scroll(width, progress_px, avail):

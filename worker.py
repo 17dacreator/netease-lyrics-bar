@@ -9,6 +9,7 @@ they are aligned.
 One JSON object per line on stdin / stdout:
   in : {"id": n, "job": "warm"}
        {"id": n, "job": "align", "song": sid, "duration": d, "lines": [...], "focus": seconds}
+       {"id": n, "job": "voice", "song": sid, "duration": d}      (done: {"voice": {...}})
        {"id": n, "job": "transcribe", "song": sid, "duration": d, "hint": "ja", "check_vocals": bool}
            (done: {"lines": [...], "singing": s, "voiced": [[start, end], ...]} or {"instrumental": true})
        {"cancel": n}
@@ -34,6 +35,11 @@ CHUNK = 30.0          # seconds separated per step during calibration
 EDGE = 2.0            # extra context either side of a stretch for Demucs
 MIN_SINGING = 4.0     # below this much clear voice a song marked instrumental is left alone
 MIN_LINES, MIN_WORDS = 3, 8   # ...above it, Whisper has to hear at least this much to count as lyrics
+# Where someone sings, for the 前奏/间奏/尾奏 labels: per 0.1 s the vocals carry at least VOICE_SHARE of
+# the song's energy. On the word-timed songs in the cache this caught 74% of sung frames; runs under
+# VOICE_MIN s are dropped (instrument bleed) and gaps up to VOICE_BRIDGE s closed.
+VOICE_SHARE, VOICE_MIN, VOICE_BRIDGE = 0.12, 0.8, 1.0
+VOICE_VERSION = 1
 
 _out_lock = threading.Lock()
 _demucs = None
@@ -107,6 +113,59 @@ def job_warm(job, cancelled):
     send({"id": job["id"], "done": {}})
 
 
+class VoiceMeter:
+    """Collects per-0.1 s energies of the vocals and the whole mix from separated stretches."""
+
+    def __init__(self, total):
+        self.n = int(np.ceil(total * 10)) + 1
+        self.sums = {"vocals": np.zeros(self.n), "all": np.zeros(self.n)}
+        self.count = np.zeros(self.n)
+
+    def add(self, stems, sr, lo):
+        """Stems of the stretch starting at `lo` seconds."""
+        k = ((lo + np.arange(len(stems["vocals"])) / sr) * 10).astype(np.int64)
+        k = np.minimum(k, self.n - 1)
+        power = {name: x.astype(np.float64) ** 2 for name, x in stems.items()}
+        self.sums["vocals"] += np.bincount(k, weights=power["vocals"], minlength=self.n)
+        self.sums["all"] += np.bincount(k, weights=sum(power.values()), minlength=self.n)
+        self.count += np.bincount(k, minlength=self.n)
+
+    def spans(self):
+        """{"v": version, "spans": [[start, end], ...]} seconds where someone sings."""
+        c = np.maximum(self.count, 1)
+        ev, et = self.sums["vocals"] / c, self.sums["all"] / c
+        audible = et > np.percentile(et, 95) * 0.01
+        on = (ev / (et + 1e-12) >= VOICE_SHARE) & audible
+        runs, i = [], 0
+        while i < len(on):
+            if on[i]:
+                j = i
+                while j < len(on) and on[j]:
+                    j += 1
+                if runs and i - runs[-1][1] <= VOICE_BRIDGE * 10:
+                    runs[-1][1] = j
+                else:
+                    runs.append([i, j])
+                i = j
+            else:
+                i += 1
+        return {"v": VOICE_VERSION,
+                "spans": [[a / 10, b / 10] for a, b in runs if b - a >= VOICE_MIN * 10]}
+
+
+def job_voice(job, cancelled):
+    jid = job["id"]
+    audio, rate = song_audio(job["song"], job.get("duration") or 0)
+    if audio is None:
+        send({"id": jid, "error": "no_cache"})
+        return
+    total = audio.shape[1] / rate
+    meter = VoiceMeter(total)
+    stems, sr = separate(audio, rate, 0.0, total)
+    meter.add(stems, sr, 0.0)
+    send({"id": jid, "done": {"voice": meter.spans()}})
+
+
 def job_align(job, cancelled):
     jid = job["id"]
     send({"id": jid, "stage": "audio"})
@@ -126,11 +185,13 @@ def job_align(job, cancelled):
         need[i] = (max(0.0, lines[i]["start"] - 1.5), min(total, nxt + 0.7))
     results = [None] * len(lines)
     done = set()
+    meter = VoiceMeter(total)              # where someone sings, for the gap labels, on the way
     send({"id": jid, "stage": "align"})
     for lo, hi in chunk_order(total, job.get("focus") or 0.0):
         if cancelled(jid):
             return
         stems, sr = separate(audio, rate, lo, hi)
+        meter.add(stems, sr, lo)
         v16 = tr.to_16k(stems["vocals"], sr)
         a = int(round(lo * align.SR))
         vocals[a: a + len(v16)] = v16[: max(0, len(vocals) - a)]
@@ -150,7 +211,7 @@ def job_align(job, cancelled):
         done |= ready
         if part:
             send({"id": jid, "partial": part})
-    send({"id": jid, "done": {"lines": results}})
+    send({"id": jid, "done": {"lines": results, "voice": meter.spans()}})
 
 
 def _voice_frames(stems, sr):
@@ -206,7 +267,7 @@ def job_transcribe(job, cancelled):
                               "lines": lines, "singing": round(sing, 1), "voiced": voiced}})
 
 
-JOBS = {"warm": job_warm, "align": job_align, "transcribe": job_transcribe}
+JOBS = {"warm": job_warm, "align": job_align, "voice": job_voice, "transcribe": job_transcribe}
 
 
 def main():
