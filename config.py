@@ -17,14 +17,15 @@ DEFAULTS = {
     "theme": 0,                # index into overlay.THEMES; len(THEMES) = custom_color
     "custom_color": None,      # "#rrggbb" picked by the user
     "show_trans": True,
-    "show_next": True,         # preview the upcoming line under the current one
-    "reveal": True,            # words appear one by one
+    "show_next": False,        # preview the upcoming line under the current one
+    "reveal": False,           # words appear one by one
     "sweep": True,             # sung part fills from white to the theme colour, left to right
     "ai_transcribe": True,     # 找词 found nothing that fits: use the Whisper transcription instead
     "calibrate": True,         # line word timing up with the audio (once per song, cached)
     "audio_sync": True,        # after a seek, re-time the clock from what the speakers play
     "seek_lead": 0.0,          # learnt: how far NetEase's progress usually runs ahead after a seek
-    "gap_label": "simple",     # label stretches nobody sings with 前奏/间奏/尾奏: off | simple
+    "gap_label": "off",        # label stretches nobody sings with 前奏/间奏/尾奏: off | simple
+    "gap_off_songs": [],       # song ids whose breaks are never labelled (right-click 间奏)
     "locked": False,
     "visible": True,
     "x": None,
@@ -45,6 +46,7 @@ class Config(dict):
         except (OSError, ValueError):
             pass
         self["song_offsets"] = dict(self.get("song_offsets") or {})
+        self["gap_off_songs"] = list(self.get("gap_off_songs") or [])
         if self["gap_label"] not in ("off", "simple"):      # "detail" (instrument names) was removed
             self["gap_label"] = "simple"
 
