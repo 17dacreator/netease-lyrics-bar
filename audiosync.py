@@ -2,10 +2,18 @@
 
 NetEase's own progress value is right when a song plays from the start, but after
 a seek it can stay off by a varying amount until the next seek or song: measured
-on this machine it ran 0.6 s and 1.0 s ahead of the sound after two seeks. So
-right after a seek (and now and then while playing) we record ~1.6 s of what the
-speakers play (WASAPI loopback; compared in memory, never stored), find that
-snippet in the song's cached audio and correct the clock by the difference.
+on this machine 0.3-2.5 s ahead of the sound, and more when the jump lands where the
+song is still downloading. So right after a seek (and now and then while playing) we
+record 4 s of what the speakers play (WASAPI loopback; compared in memory, never
+stored), find that snippet in the song's cached audio and correct the clock by the
+difference.
+
+The search spans 30 s either side and only trusts a clear winner: with a 4 s
+search a clock more than 4 s off was never corrected (and a repeated bar nearby was
+sometimes taken for it). When several places match about equally (repeated choruses,
+loops in dance tracks), the one implying the error we expect (the last measured one,
+or the usual lead right after a seek) is taken only if it is close to that and every
+other tied place is well away; otherwise nothing changes and the next snippet decides.
 
 Loopback is taken before the output device, so headphone / Bluetooth latency is
 still the user's global offset to set.
@@ -23,9 +31,14 @@ from config import DATA_DIR
 
 FS = 8000              # matching sample rate
 REC_RATE = 48000
-SNIP = 1.6             # seconds recorded per check
-SEARCH = 4.0           # look this far either side of where the clock says we are
+SNIP = 4.0             # seconds recorded per check (1.6 s matched repeated bars too often)
+SEARCH = 30.0          # look this far either side of where the clock says we are
 GOOD = 0.7             # normalised correlation needed to trust a match
+CLEAR = 0.05           # the best match must beat every other place by this much
+APART = 0.25           # seconds between places that count as different
+NEAR = 0.6             # a tie is settled by the place this close to the expected error...
+ALONE = 1.2            # ...when every other tied place is at least this far from it
+LEARN_MAX = 3.0        # bigger post-seek errors (still downloading) don't teach the usual lead
 PERIOD = 30.0          # routine re-check while playing
 SETTLE = 1.0           # after a seek NetEase restarts the sound late: let it settle first
 RETRY = 4.0            # after a failed check
@@ -126,9 +139,11 @@ class AudioSync:
                     after_seek = True
                 next_check = now + SETTLE
             if now >= next_check:
-                ok = self._check(after_seek)
-                after_seek = after_seek and not ok
-                next_check = now + (PERIOD if ok else RETRY)
+                result = self._check(after_seek)          # "clear", "tie" (settled by the expected error) or ""
+                after_seek = after_seek and result != "clear"
+                # A tie may have picked a repeat of the right bar: look again soon, so the next
+                # snippet with a clear match corrects it.
+                next_check = now + (PERIOD if result == "clear" else RETRY)
 
     def _load(self, song, duration):
         ref = load_reference(song, duration, lambda: self._stop.is_set() or self._song != song)
@@ -148,6 +163,7 @@ class AudioSync:
             try:
                 with mic.recorder(samplerate=REC_RATE, channels=2, blocksize=960) as rec:
                     rec.record(numframes=REC_RATE // 10)             # drop what was buffered
+                    epoch = self.reader.epoch
                     data = rec.record(numframes=int(SNIP * REC_RATE))
                     t_end = time.perf_counter()
             except Exception:
@@ -155,46 +171,66 @@ class AudioSync:
             mono = data.mean(1).astype(np.float32)
             if np.sqrt((mono ** 2).mean()) > 1e-4:                  # this device carries sound
                 self._device = mic
-                return t_end, mono
+                return t_end, mono, epoch
         return None
 
-    def _locate(self, q, centre):
+    def _locate(self, q, clock_end, expect):
+        """(start seconds, score, why) of `q`, recorded up to `clock_end` by the reader's
+        clock, in the cached song. start is None unless one place clearly matches best or a
+        tie is settled by `expect`, the clock error we expect (why: "weak" = nothing good,
+        "ambiguous" = an unsettled tie, "tie" = settled)."""
         ref, c2 = self._ref, self._c2
+        centre = clock_end - len(q) / FS
         a = max(0, int((centre - SEARCH) * FS))
         b = min(len(ref), int((centre + SEARCH) * FS) + len(q))
         seg = ref[a:b]
         if len(seg) <= len(q):
-            return None, 0.0
+            return None, 0.0, "weak"
         n = 1 << int(np.ceil(np.log2(len(seg) + len(q))))
         corr = np.fft.irfft(np.fft.rfft(seg, n) * np.conj(np.fft.rfft(q, n)), n)[: len(seg) - len(q) + 1]
         energy = np.sqrt(np.maximum(c2[a + len(q): a + len(seg) + 1] - c2[a: a + len(seg) - len(q) + 1], 0))
         ncc = corr / (energy * np.sqrt(float((q.astype(np.float64) ** 2).sum())) + 1e-9)
         k = int(np.argmax(ncc))
-        return (a + k) / FS, float(ncc[k])
+        best = float(ncc[k])
+        if best < GOOD:
+            return None, best, "weak"
+        close = np.flatnonzero(ncc >= best - CLEAR)          # every place about as good
+        if np.abs(close - k).max() <= APART * FS:
+            return (a + k) / FS, best, ""
+        groups = np.split(close, np.flatnonzero(np.diff(close) > APART * FS) + 1)
+        if len(groups) == 1:                                  # one long smear (a held note): no timing
+            return None, best, "ambiguous"
+        tied = sorted(((a + g[np.argmax(ncc[g])]) / FS for g in groups),
+                      key=lambda s: abs(clock_end - s - len(q) / FS - expect))
+        miss = [abs(clock_end - s - len(q) / FS - expect) for s in tied]
+        if miss[0] <= NEAR and miss[1] >= ALONE:
+            return tied[0], best, "tie"
+        return None, best, "ambiguous"
 
     def _check(self, after_seek):
         song = self._song
         rec = self._record()
         if rec is None:
             self.last = "no sound on any loopback device"
-            return False
-        t_end, x = rec
+            return ""
+        t_end, x, epoch = rec
         state, now_song, _, pos_now = self.reader.snapshot()
-        if now_song != song or state != "playing":
-            return False
+        if now_song != song or state != "playing" or self.reader.epoch != epoch:
+            return ""                                           # moved on, or seeked mid-recording
         clock_end = pos_now - (time.perf_counter() - t_end)      # reader position when recording ended
         q = decimate(x)
         q -= q.mean()
-        start, score = self._locate(q, clock_end - SNIP)
-        if start is None or score < GOOD:
-            self.last = f"no confident match ({score:.2f})"
-            _log(f"{song} {'seek ' if after_seek else ''}no match {score:.2f}")
-            return False
+        start, score, why = self._locate(q, clock_end, self.correction)
+        if start is None:
+            self.last = f"no {'clear' if why == 'ambiguous' else 'confident'} match ({score:.2f})"
+            _log(f"{song} {'seek ' if after_seek else ''}{'ambiguous' if why == 'ambiguous' else 'no match'} {score:.2f}")
+            return ""
         error = clock_end - (start + len(q) / FS)
         if abs(error - self.correction) > 0.03:
             self.correction = error
-        if after_seek:              # learn how far NetEase usually runs ahead right after a seek
+        if after_seek and why != "tie" and abs(error) <= LEARN_MAX:   # learn the usual lead after a seek
             self.cfg["seek_lead"] = round(0.7 * self.cfg.get("seek_lead", 0.0) + 0.3 * error, 3)
         self.last = f"clock off by {error * 1000:+.0f} ms (match {score:.2f})"
-        _log(f"{song} {'seek ' if after_seek else ''}off {error * 1000:+.0f} ms match {score:.2f}")
-        return True
+        _log(f"{song} {'seek ' if after_seek else ''}off {error * 1000:+.0f} ms match {score:.2f}"
+             + (" (tie settled)" if why == "tie" else ""))
+        return "tie" if why == "tie" else "clear"
